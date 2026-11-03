@@ -425,15 +425,15 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
     switch (imm) {
         case 0x01: {  // SetHeapSize(size) -> addr
             uint64_t size = c.x[1];
-            if (size > kHeapMax) {
+            if (size > g_layout.heap_max) {
                 rc = 0xD001;
                 break;
             }
-            if (size > g_heap_size) commit(kHeapBase + g_heap_size, size - g_heap_size);
-            vm_set(kHeapBase, kHeapMax, kMemInaccessible, 0);
-            if (size) vm_set(kHeapBase, size, kMemHeap, 3);
+            if (size > g_heap_size) commit(g_layout.heap_base + g_heap_size, size - g_heap_size);
+            vm_set(g_layout.heap_base, g_layout.heap_max, kMemInaccessible, 0);
+            if (size) vm_set(g_layout.heap_base, size, kMemHeap, 3);
             g_heap_size = size;
-            c.x[1] = kHeapBase;
+            c.x[1] = g_layout.heap_base;
             break;
         }
         case 0x02:  // SetMemoryPermission
@@ -443,7 +443,7 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
             uint64_t dst = c.x[0], src = c.x[1], size = c.x[2];
             commit(dst, size);
             std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<void*>(src), size);
-            vm_set(dst, size, dst - kStackBase < kStackSize ? kMemStack : kMemAlias, 3);
+            vm_set(dst, size, dst - g_layout.stack_base < g_layout.stack_size ? kMemStack : kMemAlias, 3);
             break;
         }
         case 0x05: {  // UnmapMemory(dst, src, size)
@@ -644,7 +644,7 @@ void svc(CPU& c, uint32_t imm, uint64_t pc) {
             break;
         case 0x2D:  // UnmapPhysicalMemory
             decommit(c.x[0], c.x[1]);
-            vm_set(c.x[0], c.x[1], c.x[0] - kAliasBase < kAliasSize ? kMemFree : kMemInaccessible, 0);
+            vm_set(c.x[0], c.x[1], c.x[0] - g_layout.alias_base < g_layout.alias_size ? kMemFree : kMemInaccessible, 0);
             break;
         case 0x34:
             rc = svc_wait_for_address(c.x[0], uint32_t(c.x[1]), int32_t(c.x[2]), int64_t(c.x[3]));

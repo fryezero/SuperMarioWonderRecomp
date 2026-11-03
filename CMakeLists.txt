@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.25)
 project(SwitchGamesRecomp C CXX)
+if(IOS)
+    enable_language(OBJCXX)  # platform_ios.mm: the UIKit app
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,10 +34,29 @@ endif()
 if(WIN32)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
+if(IOS)
+    # tools/build_ios.sh configures this with the Xcode generator and signs with a (free) personal team.
+    set(NX_IOS_TEAM "" CACHE STRING "Apple development team that signs the iOS app")
+    set(NX_IOS_BUNDLE_ID "" CACHE STRING "iOS bundle identifier (default com.wonderrecomp.<team>)")
+    if(NOT NX_IOS_BUNDLE_ID)
+        # Unique among all Apple developer accounts because it carries the team; tools/ios_env.sh defaults the same.
+        string(TOLOWER "com.wonderrecomp.${NX_IOS_TEAM}" NX_IOS_BUNDLE_ID)
+    endif()
+    # The device's own CPU: LSE atomics for the guest's exclusive accesses and the runtime's locks, and its scheduling
+    # model. Clang names the A20 (the A20 Pro is the same core design with more of them).
+    set(NX_IOS_CPU "apple-a20" CACHE STRING "-mcpu for the iOS device")
+    # No dSYM (dsymutil over 150 MB of code takes minutes) and no index store: Xcode would index all 1.2 GB of
+    # generated C++ while building it.
+    set(CMAKE_XCODE_ATTRIBUTE_DEBUG_INFORMATION_FORMAT dwarf)
+    set(CMAKE_XCODE_ATTRIBUTE_COMPILER_INDEX_STORE_ENABLE NO)
+    if(NOT NX_IOS_TEAM)
+        message(WARNING "NX_IOS_TEAM is empty: Xcode cannot sign the app")
+    endif()
+endif()
 
 # Unit tests of runtime pieces that build without the game (docs/nvn/WINDOWS-PLAN.md, "Test plan"): ctest.
 option(NX_TESTS "Build the standalone unit tests" OFF)
-if(NX_TESTS AND NOT ANDROID)
+if(NX_TESTS AND NOT ANDROID AND NOT IOS)
     enable_testing()
     add_executable(gpu_pick_test tests/gpu_pick_test.cpp runtime/src/nvn/nvn_gpu_pick.cpp)
     target_compile_definitions(gpu_pick_test PRIVATE NX_GPU_PICK_STANDALONE)
@@ -76,6 +98,8 @@ foreach(mod main sdk)
         # armv8.2-a+crypto: cpu.h's AES/SHA paths need __ARM_FEATURE_AES/SHA2 (the NDK default armv8-a has neither).
         target_compile_options(game_${mod} PRIVATE -O2 -fPIC -fvisibility=hidden -fno-semantic-interposition
                                -march=armv8.2-a+crypto)
+    elseif(IOS)
+        target_compile_options(game_${mod} PRIVATE -O2 -fvisibility=hidden -mcpu=${NX_IOS_CPU})
     elseif(APPLE)
         target_compile_options(game_${mod} PRIVATE -O2 -fvisibility=hidden)
     endif()
@@ -100,6 +124,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/hle_net.cpp
     runtime/src/hle_audio.cpp
     runtime/src/hle_pl.cpp
+    runtime/src/hle_nfp.cpp
     runtime/src/input_script.cpp
     runtime/src/touch_layout.cpp
     runtime/src/perf_hint.cpp
@@ -141,6 +166,8 @@ set(NX_RUNTIME_SOURCES
     runtime/src/nvn/nvn_pipeline.cpp
     runtime/src/nvn/nvn_dummy.cpp
     runtime/src/nvn/nvn_pipeline_cache.cpp
+    runtime/src/nvn/nvn_pipeline_warm.cpp
+    runtime/src/nvn/nvn_pipeline_capture.cpp
     runtime/src/nvn/nvn_upload.cpp
     runtime/src/nvn/nvn_astc.cpp
     runtime/src/nvn/nvn_spirv_patch.cpp
@@ -173,7 +200,7 @@ if(ANDROID)
     set(GLUE "${ANDROID_NDK}/sources/android/native_app_glue")
     add_library(${NX_GAME} SHARED ${NX_RUNTIME_SOURCES} runtime/src/platform_android.cpp
         runtime/src/platform_android_input.cpp runtime/src/platform_android_audio.cpp runtime/src/memguard_android.cpp
-        "${GLUE}/android_native_app_glue.c")
+        runtime/src/touch_controls.cpp "${GLUE}/android_native_app_glue.c")
     target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_SDK}/Include" "${GLUE}")
     # Our ANativeActivity_onCreate (platform_android.cpp) runs first, on the UI thread, then calls the glue's.
     set_source_files_properties("${GLUE}/android_native_app_glue.c" PROPERTIES
@@ -182,17 +209,57 @@ if(ANDROID)
     target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden -fno-semantic-interposition -march=armv8.2-a+crypto)
     # The glue's ANativeActivity_onCreate must be exported. 16 KB page alignment: Android 15+ devices with 16 KB pages.
     target_link_options(${NX_GAME} PRIVATE -u ANativeActivity_onCreate -Wl,-z,max-page-size=16384)
+elseif(IOS)
+    # iOS (APPLE is true here too): a UIKit app bundle on MoltenVK, linked statically (iOS has no Vulkan loader).
+    # Game data goes to the app's Documents (tools/wonder_push_ios.sh).
+    set(NX_VULKAN_INCLUDE "/opt/homebrew/opt/vulkan-headers/include" CACHE PATH
+        "Vulkan headers: the Homebrew keg, as /opt/homebrew/include also holds the macOS SDL3 headers")
+    set(NX_MOLTENVK_DIR "${CMAKE_SOURCE_DIR}/private/tools/moltenvk/MoltenVK/MoltenVK")
+    set(NX_MOLTENVK "${NX_MOLTENVK_DIR}/static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a" CACHE FILEPATH
+        "MoltenVK static library for iOS devices")
+    if(NOT EXISTS "${NX_MOLTENVK}")
+        # Otherwise only the final link notices, after the generated code has compiled for hours.
+        message(FATAL_ERROR "No MoltenVK for iOS at ${NX_MOLTENVK} (set NX_MOLTENVK)")
+    endif()
+    set(NX_MOLTENVK_INCLUDE "${NX_MOLTENVK_DIR}/include" CACHE PATH "MoltenVK headers (MoltenVK/*.h)")
+    add_executable(${NX_GAME} MACOSX_BUNDLE ${NX_RUNTIME_SOURCES} runtime/src/platform_darwin.cpp
+        runtime/src/platform_ios.mm runtime/src/memguard_mac.cpp runtime/src/touch_controls.cpp)
+    # The Vulkan headers before MoltenVK's: vulkan/vulkan.h must be the registry version tools/gen_vk.py used.
+    target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_INCLUDE}"
+        "${NX_MOLTENVK_INCLUDE}")
+    target_link_libraries(${NX_GAME} PRIVATE game_main game_sdk "${NX_MOLTENVK}"
+        "-framework Metal" "-framework QuartzCore" "-framework IOSurface" "-framework UIKit" "-framework Foundation"
+        "-framework CoreGraphics" "-framework GameController" "-framework AVFAudio" "-framework AudioToolbox"
+        "-framework CoreHaptics" c++)
+    target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden -mcpu=${NX_IOS_CPU})
+    set_source_files_properties(runtime/src/platform_ios.mm PROPERTIES COMPILE_OPTIONS -fobjc-arc)
+    # ios/Info.plist.in reads the MACOSX_BUNDLE_* values; CFBundleIdentifier must equal PRODUCT_BUNDLE_IDENTIFIER.
+    set_target_properties(${NX_GAME} PROPERTIES
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/ios/Info.plist.in"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "${NX_IOS_BUNDLE_ID}"
+        MACOSX_BUNDLE_BUNDLE_NAME "${NX_GAME}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
+        MACOSX_BUNDLE_BUNDLE_VERSION "1"
+        XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${NX_IOS_BUNDLE_ID}"
+        XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${NX_IOS_TEAM}"
+        XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
+        XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "Apple Development"
+        XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS "${CMAKE_SOURCE_DIR}/ios/Wonder.entitlements"
+        XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1"
+        XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "17.0"
+        XCODE_ATTRIBUTE_ENABLE_BITCODE "NO")
 elseif(APPLE)
     # macOS: SDL3 (window, input, audio) and the Vulkan loader + MoltenVK from Homebrew
     # (brew install sdl3 vulkan-headers vulkan-loader molten-vk).
     find_package(SDL3 REQUIRED CONFIG)
     find_path(NX_VULKAN_INCLUDE vulkan/vulkan.h HINTS /opt/homebrew/include /usr/local/include)
-    add_executable(${NX_GAME} ${NX_RUNTIME_SOURCES} runtime/src/platform_mac.cpp runtime/src/memguard_mac.cpp)
+    add_executable(${NX_GAME} ${NX_RUNTIME_SOURCES} runtime/src/platform_darwin.cpp runtime/src/platform_mac.cpp
+        runtime/src/memguard_mac.cpp)
     target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_INCLUDE}")
     target_link_libraries(${NX_GAME} PRIVATE game_main game_sdk SDL3::SDL3)
     target_compile_options(${NX_GAME} PRIVATE -fvisibility=hidden)
     # The executable loads near 0x1_0000_0000, below the guest ranges (0x40_0000_0000 and up). The game runs on its
-    # own thread with a 64 MiB stack (platform_mac.cpp), so the main thread's stack size does not matter.
+    # own thread with a 64 MiB stack (platform_darwin.cpp), so the main thread's stack size does not matter.
 else()
     add_executable(${NX_GAME} ${NX_RUNTIME_SOURCES} runtime/src/platform_win.cpp runtime/src/memguard_win.cpp)
     target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_GAME_DIR}" "${NX_VULKAN_SDK}/Include")

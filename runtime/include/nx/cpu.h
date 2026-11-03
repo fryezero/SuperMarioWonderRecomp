@@ -15,13 +15,14 @@
 #include <intrin.h>
 #endif
 
-// Where the modules are mapped. macOS on Apple silicon keeps 0x10_0000_0000..0x6F_FFFF_FFFF for itself (fixed
-// mappings there fail) and puts the dyld shared cache at 0x1_8000_0000..0x3_0000_0000, so the guest address space
-// moves to 0x3_0000_0000..0xF_FFFF_FFFF there, still inside Horizon's 39 bits. Generated code adds each module's
-// offset to this.
+// Where the modules are mapped; generated code adds each module's offset to this, so changing it needs a rebuild,
+// not a new recompile. Apple (macOS 27, iOS 27): the top 512 MiB of 0x70_0000_0000..0x80_0000_0000, still inside
+// Horizon's 39 bits. That window is the only large free space below 0x80_0000_0000 on both (on iOS only with the
+// increased-memory-limit entitlement), and the host's own allocations start at its bottom; memory_init places the
+// other guest regions below the modules (runtime.h, memory.cpp).
 #ifndef NX_BASE
 #if defined(__APPLE__)
-#define NX_BASE 0x0000000300000000ull
+#define NX_BASE 0x0000007FE0000000ull
 #else
 #define NX_BASE 0x0000004000000000ull
 #endif

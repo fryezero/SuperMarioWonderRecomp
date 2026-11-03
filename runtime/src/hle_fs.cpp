@@ -9,6 +9,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 #if defined(_WIN32)
 #include <io.h>
@@ -38,7 +40,12 @@ constexpr uint32_t kPathAlreadyExists = 0x402;  // fs 2
 constexpr uint32_t kTargetNotFound = 0x2EE202;  // fs 6001-ish: generic "not mounted"
 
 std::mutex g_fs;
-std::map<std::string, fs::path> g_mounts;
+// The RomFS is read-only, which lets the case-insensitive lookup below keep its directory listings.
+struct Mount {
+    fs::path root;
+    bool read_only;
+};
+std::map<std::string, Mount> g_mounts;
 // Open files: shared so a read in progress survives a close from another thread. Reads run outside g_fs (which
 // only guards the tables): one global lock made every streaming thread (Bink animations, FMOD banks) wait behind
 // any big read, felt as hitches.
@@ -55,11 +62,14 @@ std::map<uint64_t, std::shared_ptr<File>> g_files;
 // Files the runtime adds or replaces (mods): key = path under the mount point, '/' separated, lower case.
 std::map<std::string, std::string> g_virtual;
 
-std::string virtual_key(const fs::path& p) {
-    auto g = p.lexically_normal().generic_u8string();
-    std::string s(g.begin(), g.end());
+std::string lower(std::string s) {
     for (char& ch : s) ch = char(std::tolower(static_cast<unsigned char>(ch)));
     return s;
+}
+
+std::string virtual_key(const fs::path& p) {
+    auto g = p.lexically_normal().generic_u8string();
+    return lower(std::string(g.begin(), g.end()));
 }
 
 // The virtual file whose key the resolved path ends with, or nullptr.
@@ -88,21 +98,113 @@ std::string utf8(const fs::path& p) {
 
 std::string cstr(uint64_t p) { return p ? std::string(reinterpret_cast<const char*>(p)) : std::string(); }
 
-// "mount:/a/b" -> host path; empty when the mount is unknown.
-fs::path resolve(const std::string& guest) {
+// "mount:/a/b" -> the mount and "a/b"; nullptr when the mount is unknown.
+const Mount* split(const std::string& guest, fs::path& rest) {
     auto colon = guest.find(':');
-    if (colon == std::string::npos) return {};
+    if (colon == std::string::npos) return nullptr;
     auto it = g_mounts.find(guest.substr(0, colon));
-    if (it == g_mounts.end()) return {};
-    std::string rest = guest.substr(colon + 1);
-    while (!rest.empty() && (rest[0] == '/' || rest[0] == '\\')) rest.erase(0, 1);
-    return it->second / fs::u8path(rest);
+    if (it == g_mounts.end()) return nullptr;
+    size_t start = guest.find_first_not_of("/\\", colon + 1);
+    rest = fs::u8path(start == std::string::npos ? std::string() : guest.substr(start));
+    return &it->second;
 }
 
-void mount(const std::string& name, const fs::path& p) {
+// "mount:/a/b" -> host path, spelled as the guest wrote it; empty when the mount is unknown.
+fs::path resolve(const std::string& guest) {
+    fs::path rest;
+    const Mount* m = split(guest, rest);
+    return m ? m->root / rest : fs::path();
+}
+
+void mount(const std::string& name, const fs::path& p, bool read_only) {
     fs::create_directories(p);
-    g_mounts[name] = p;
+    g_mounts.insert_or_assign(name, Mount{p, read_only});
     log("fs: mounted %s: -> %s", name.c_str(), p.string().c_str());
+}
+
+// ---- case-insensitive lookup ----------------------------------------------------------------------------------
+// Every host so far kept the RomFS on a case-insensitive file system (macOS, Windows), so a guest path whose case
+// differs from the extracted file has always worked. iOS storage is case-sensitive: there, when the exact path is
+// missing, each component is matched against its directory's names, lowercased (ASCII only, as virtual_key does).
+// A path that exists as spelled costs nothing more. RomFS listings are kept, since it never changes; the save and
+// cache mounts change under the game and hold few files, so they are listed again on every miss.
+
+// Lowercased name -> name on disk, for one directory. Names that differ only in case cannot come from a
+// case-insensitive host; if a directory has them anyway, the first one listed wins.
+using DirIndex = std::unordered_map<std::string, std::string>;
+
+// Adds dir's names to index; false when the listing failed, entirely or part way.
+bool list_dir(const fs::path& dir, DirIndex& index) {
+    std::error_code ec;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::string name = utf8(it->path().filename());
+        index.try_emplace(lower(name), name);
+    }
+    return !ec;
+}
+
+std::mutex g_case_lock;  // guards the two below: read_game_file matches names without holding g_fs
+std::unordered_map<std::string, DirIndex> g_case_cache;  // RomFS directory (host path) -> its names, if fully listed
+std::unordered_set<std::string> g_case_logged;
+
+// The name on disk in dir that matches name when case is ignored, or empty. Called with g_case_lock held.
+std::string find_name(const fs::path& dir, const std::string& name, bool cache) {
+    std::string key = lower(name);
+    if (cache) {
+        auto it = g_case_cache.find(utf8(dir));
+        if (it != g_case_cache.end()) {
+            auto hit = it->second.find(key);
+            return hit == it->second.end() ? std::string() : hit->second;
+        }
+    }
+    DirIndex index;
+    bool complete = list_dir(dir, index);
+    auto hit = index.find(key);
+    std::string found = hit == index.end() ? std::string() : hit->second;
+    if (cache && complete) g_case_cache.emplace(utf8(dir), std::move(index));
+    return found;
+}
+
+// The host path under root whose components match rest's when case is ignored, if one differs in case from rest;
+// else empty. Each match is logged once (up to a limit) by what, the name the caller knows the file by: the
+// lasting fix is to rename the file on disk.
+fs::path match_case(const fs::path& root, const fs::path& rest, bool cache, const std::string& what) {
+    std::lock_guard lk(g_case_lock);
+    fs::path host = root, found;
+    bool differs = false;
+    for (const fs::path& part : rest) {
+        std::string name = utf8(part);
+        if (name.empty() || name == ".") continue;
+        std::string disk = find_name(host, name, cache);
+        if (disk.empty()) return {};
+        differs |= disk != name;
+        host /= fs::u8path(disk);
+        found /= fs::u8path(disk);
+    }
+    if (!differs) return {};  // the exact spelling, which the caller already found missing
+    constexpr size_t kMaxLogged = 64;
+    if (g_case_logged.size() <= kMaxLogged && g_case_logged.insert(what).second) {
+        if (g_case_logged.size() <= kMaxLogged)
+            log("fs: %s found as %s (case differs)", what.c_str(), utf8(found).c_str());
+        else
+            log("fs: more paths found only by ignoring case; no longer logged");
+    }
+    return host;
+}
+
+// The host path of an existing guest file or directory, with its status; empty when there is none. p is
+// resolve(guest): when it exists this is the one stat it always was, and only a miss is matched ignoring case.
+fs::path existing(const std::string& guest, const fs::path& p, fs::file_status& status) {
+    if (p.empty()) return {};
+    std::error_code ec;
+    status = fs::status(p, ec);
+    if (fs::exists(status)) return p;
+    fs::path rest;
+    const Mount* m = split(guest, rest);
+    fs::path host = match_case(m->root, rest, m->read_only, guest);
+    if (host.empty()) return {};
+    status = fs::status(host, ec);
+    return fs::exists(status) ? host : fs::path();
 }
 
 // ---- mounts ---------------------------------------------------------------------------------------------------
@@ -114,7 +216,7 @@ void QueryMountRomCacheSize(CPU& c) {
 
 void MountRom(CPU& c) {
     std::lock_guard lk(g_fs);
-    mount(cstr(c.x[0]), data_root() / "extract" / "romfs");
+    mount(cstr(c.x[0]), data_root() / "extract" / "romfs", true);
     c.x[0] = kOk;
 }
 
@@ -123,7 +225,7 @@ void EnsureSaveData(CPU& c) { c.x[0] = kOk; }
 void MountSaveData(CPU& c) {
     std::lock_guard lk(g_fs);
     std::string name = cstr(c.x[0]);
-    mount(name, data_root() / "user" / "save");
+    mount(name, data_root() / "user" / "save", false);
     c.x[0] = kOk;
 }
 
@@ -186,18 +288,19 @@ void CreateDirectory(CPU& c) {
 
 void GetEntryType(CPU& c) {  // (DirectoryEntryType* out, path)
     std::lock_guard lk(g_fs);
-    fs::path p = resolve(cstr(c.x[1]));
+    std::string guest = cstr(c.x[1]);
+    fs::path p = resolve(guest);
     if (find_virtual(p)) {
         st<uint32_t>(c.x[0], 1);
         c.x[0] = kOk;
         return;
     }
-    std::error_code ec;
-    if (p.empty() || !fs::exists(p, ec)) {
+    fs::file_status status;
+    if (existing(guest, p, status).empty()) {
         c.x[0] = kPathNotFound;
         return;
     }
-    st<uint32_t>(c.x[0], fs::is_directory(p) ? 0 : 1);
+    st<uint32_t>(c.x[0], fs::is_directory(status) ? 0 : 1);
     c.x[0] = kOk;
 }
 
@@ -221,13 +324,14 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
         c.x[0] = kOk;
         return;
     }
-    std::error_code ec;
-    if (p.empty() || !fs::is_regular_file(p, ec)) {
+    fs::file_status status;
+    fs::path host = existing(guest, p, status);
+    if (host.empty() || !fs::is_regular_file(status)) {
         if (trace_fs()) log("fs: OpenFile(%s) not found", guest.c_str());
         c.x[0] = kPathNotFound;
         return;
     }
-    FILE* f = plat::fopen_utf8(utf8(p), (mode & 2) ? "r+b" : "rb");
+    FILE* f = plat::fopen_utf8(utf8(host), (mode & 2) ? "r+b" : "rb");
     if (!f) {
         c.x[0] = kPathNotFound;
         return;
@@ -330,15 +434,17 @@ void FlushFile(CPU& c) {
 
 void OpenDirectory(CPU& c) {  // (DirectoryHandle* out, path, int mode: 1 dirs, 2 files)
     std::lock_guard lk(g_fs);
-    fs::path p = resolve(cstr(c.x[1]));
+    std::string guest = cstr(c.x[1]);
     int mode = int(c.x[2]);
-    std::error_code ec;
-    if (p.empty() || !fs::is_directory(p, ec)) {
+    fs::file_status status;
+    fs::path host = existing(guest, resolve(guest), status);
+    if (host.empty() || !fs::is_directory(status)) {
         c.x[0] = kPathNotFound;
         return;
     }
     Dir d;
-    for (auto& e : fs::directory_iterator(p, ec)) {
+    std::error_code ec;
+    for (auto& e : fs::directory_iterator(host, ec)) {
         bool dir = e.is_directory();
         if ((dir && (mode & 1)) || (!dir && (mode & 2))) d.entries.push_back(e);
     }
@@ -399,7 +505,7 @@ void CreateCacheStorage(CPU& c) { c.x[0] = kOk; }
 void DeleteCacheStorage(CPU& c) { c.x[0] = kOk; }
 void MountCacheStorage(CPU& c) {  // (name, int index)
     std::lock_guard lk(g_fs);
-    mount(cstr(c.x[0]), data_root() / "user" / ("cache" + std::to_string(int(c.x[1]))));
+    mount(cstr(c.x[0]), data_root() / "user" / ("cache" + std::to_string(int(c.x[1]))), false);
     c.x[0] = kOk;
 }
 
@@ -480,7 +586,12 @@ void add_virtual_file(const std::string& path, std::string data) {
 }
 
 std::string read_game_file(const std::string& relative_to_romfs) {
-    FILE* f = plat::fopen_utf8(utf8(data_root() / "extract" / "romfs" / fs::u8path(relative_to_romfs)), "rb");
+    fs::path root = data_root() / "extract" / "romfs", rel = fs::u8path(relative_to_romfs);
+    FILE* f = plat::fopen_utf8(utf8(root / rel), "rb");
+    if (!f) {
+        fs::path host = match_case(root, rel, true, relative_to_romfs);
+        if (!host.empty()) f = plat::fopen_utf8(utf8(host), "rb");
+    }
     if (!f) return {};
     std::string s;
     char buf[65536];

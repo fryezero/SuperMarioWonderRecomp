@@ -1,0 +1,7 @@
+<Project>
+  <!-- Build products go to private/build/romfs_patch, never next to the sources. -->
+  <PropertyGroup>
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)../../private/build/romfs_patch/obj/</BaseIntermediateOutputPath>
+    <BaseOutputPath>$(MSBuildThisFileDirectory)../../private/build/romfs_patch/bin/</BaseOutputPath>
+  </PropertyGroup>
+</Project>

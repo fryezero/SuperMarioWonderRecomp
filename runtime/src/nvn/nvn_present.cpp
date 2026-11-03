@@ -5,7 +5,9 @@
 // - Fit with bars: a 16:9 picture on a 19.5:9 screen keeps its shape.
 // - Alpha 1: an Android surface may take the image's alpha as transparency (compositeAlpha INHERIT), and the game's
 //   final image has no meaningful alpha.
-// On by default on Android. NX_PRESENT_PASS=1 turns it on elsewhere (checking it on the Mac), =0 off (the blit).
+// - The touch controls drawn over it.
+// On by default on phones (Android, iOS: phone.h). NX_PRESENT_PASS=1 turns it on elsewhere (checking it on the Mac),
+// =0 off (the blit). Also the swapchain's present mode and image count.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +15,7 @@
 #include <vector>
 
 #include "nvn_vk.h"
+#include "phone.h"
 #include "platform.h"
 
 namespace nx::nvn {
@@ -297,13 +300,42 @@ bool make_pipeline(VkFormat format) {
 bool present_pass_wanted() {
     static const bool on = [] {
         const char* e = std::getenv("NX_PRESENT_PASS");
-#if defined(__ANDROID__)
+#if NX_PHONE
         return !e || e[0] != '0';
 #else
         return e && e[0] == '1';
 #endif
     }();
     return on;
+}
+
+// The game paces itself on its vsync event (hle_vi.cpp, 60 Hz): a FIFO present also waited for the display's own
+// refresh, two clocks drifting against each other (stutter near 60 fps, docs/nvn/DEBUG.md #33). MAILBOX never blocks
+// and shows the newest frame at each refresh; else IMMEDIATE (MoltenVK: no display sync in the Metal layer, the macOS
+// compositor still shows whole frames at its refresh), FIFO last. NX_FIFO=1: FIFO (DEBUG.md #62). Where FIFO is all
+// there is (MoltenVK on iOS), the display's vsync drives the game's vsync event and the pacing (plat::vsync_source),
+// one clock again.
+// Three images, FIFO included: one shown, one queued for the next refresh, one being drawn. With two, each FIFO present
+// would wait in vkAcquireNextImageKHR for a refresh to free one, on the thread that replays, and the next frame's
+// replay with it. More would only let frames queue up, a refresh of latency each, when the game runs ahead of the
+// display, which the pacing on the display's vsync prevents (nvn_queue.cpp).
+VkPresentModeKHR present_mode(VkPhysicalDevice physical, VkSurfaceKHR surface, const VkSurfaceCapabilitiesKHR& caps,
+                              uint32_t& images) {
+    images = std::max(caps.minImageCount, 3u);
+    if (caps.maxImageCount) images = std::min(images, caps.maxImageCount);
+    uint32_t n = 0;
+    p_vkGetPhysicalDeviceSurfacePresentModesKHR(physical, surface, &n, nullptr);
+    std::vector<VkPresentModeKHR> modes(n);
+    p_vkGetPhysicalDeviceSurfacePresentModesKHR(physical, surface, &n, modes.data());
+    auto has = [&](VkPresentModeKHR m) { return std::find(modes.begin(), modes.end(), m) != modes.end(); };
+    const bool fifo_asked = std::getenv("NX_FIFO") != nullptr;
+    VkPresentModeKHR mode = !fifo_asked && has(VK_PRESENT_MODE_MAILBOX_KHR)     ? VK_PRESENT_MODE_MAILBOX_KHR
+                            : !fifo_asked && has(VK_PRESENT_MODE_IMMEDIATE_KHR) ? VK_PRESENT_MODE_IMMEDIATE_KHR
+                                                                                : VK_PRESENT_MODE_FIFO_KHR;
+    static const char* const names[] = {"IMMEDIATE", "MAILBOX", "FIFO", "FIFO_RELAXED"};
+    log("nvn/vk: present mode %s (%u modes offered%s), %u images asked for", mode <= 3 ? names[mode] : "?", n,
+        mode != VK_PRESENT_MODE_FIFO_KHR ? "" : fifo_asked ? ": NX_FIFO" : ": no MAILBOX or IMMEDIATE", images);
+    return mode;
 }
 
 void present_pass_release() { destroy_targets(); }  // before the swapchain whose images they view is destroyed
@@ -383,7 +415,7 @@ bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop,
     float tw = float(sideways ? g.extent.height : g.extent.width), th = float(sideways ? g.extent.width : g.extent.height);
     float scale = std::min(tw / cw, th / ch), bw = cw * scale / tw, bh = ch * scale / th;
     p.box[0] = (1 - bw) / 2, p.box[1] = (1 - bh) / 2, p.box[2] = bw, p.box[3] = bh;
-    // The touch controls (platform_android_input.cpp), in upright uv; none elsewhere.
+    // The touch controls (touch_controls.cpp on phones), in upright uv; none elsewhere.
     plat::OverlayShape shapes[kOverlayMax];
     size_t count = plat::touch_overlay(shapes, kOverlayMax);
     auto* dst = reinterpret_cast<float*>(ubo.ptr);

@@ -5,7 +5,7 @@
   A <b>Projeto Belmante</b> project &middot; <a href="https://www.youtube.com/@belmante">youtube.com/@belmante</a>
 </p>
 
-Static recompilation of **Super Mario Bros. Wonder** (Nintendo Switch, 1.0.0, title ID `010015100B514000`) to native
+Static recompilation of **Super Mario Bros. Wonder** (Nintendo Switch, 1.0.0 and 1.2.1, title ID `010015100B514000`) to native
 code. No emulator runs: the game's AArch64 machine code becomes C++ compiled for the host, and its system and graphics
 calls (NVN, Nintendo's own API) are implemented natively on **Vulkan** (MoltenVK on the Mac).
 
@@ -38,6 +38,7 @@ Part of the [SwitchGamesRecomp](https://github.com/BelmanteGu/SwitchGamesRecomp)
 | macOS (Apple Silicon) | works, the reference platform | Vulkan on Metal through MoltenVK |
 | Windows (x86-64) | works, tested on NVIDIA (RTX 3050) and Intel GPUs | native Vulkan 1.3 |
 | Android (arm64) | works, tested on a Galaxy S23 | native Vulkan 1.3 |
+| iOS (arm64) | works, 60 fps on an iPhone 18 Pro Max (game version 1.2.1), see [docs/IOS.md](docs/IOS.md) | Vulkan on Metal through MoltenVK, linked in |
 | Linux | **not ported yet, but close** | native Vulkan 1.3 |
 
 Linux is not a rewrite. The recompiled game code is portable C++ and the NVN layer talks only generic Vulkan, with
@@ -89,6 +90,21 @@ described in [docs/nvn/WINDOWS-PORT.md](docs/nvn/WINDOWS-PORT.md) and [WINDOWS-P
 the PC quality work in [docs/nvn/pc-quality/](docs/nvn/pc-quality/). `dev.ps1` sets up the build environment
 (Visual Studio Build Tools, clang, CMake, Ninja, Vulkan SDK) and `tools/pack_pc_wonder.py` packs your own data for
 the PC. The recompile, shader and build steps are the same as in the macOS section below.
+
+### iOS
+
+Wonder 1.2.1 runs on the iPhone 18 Pro Max at 60 fps (course 1-1 holds a median of 60 through a 30-minute soak),
+with touch controls, Bluetooth controllers and sound. It installs from Xcode with a free Apple ID: the
+increased-memory-limit entitlement, which free teams may sign, is what opens enough address space for the guest. The
+build, the data push, what the device allows and the measurements are in [docs/IOS.md](docs/IOS.md).
+
+```sh
+tools/build_ios.sh --install       # Xcode project, signed with your team (private/ios.env)
+tools/wonder_push_ios.sh           # your data -> the app's Documents (about 4 GB, USB)
+tools/build_ios.sh --launch --console
+```
+
+The app contains recompiled game code built from your own dump. It is for you only: never share or publish it.
 
 ### Android
 

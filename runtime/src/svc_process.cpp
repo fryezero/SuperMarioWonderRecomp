@@ -19,20 +19,20 @@ uint64_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint32_t& rc) {
     switch (type) {
         case 0: return 0xF;                         // AllowedCpuIdBitmask
         case 1: return 0xFFFFFFFFFFFFFFFFull >> 0;  // AllowedThreadPriorityMask
-        case 2: return kAliasBase;
-        case 3: return kAliasSize;
-        case 4: return kHeapBase;
-        case 5: return kHeapMax;
+        case 2: return g_layout.alias_base;
+        case 3: return g_layout.alias_size;
+        case 4: return g_layout.heap_base;
+        case 5: return g_layout.heap_max;
         case 6: return 0xCD500000;  // TotalMemoryAvailable (~3.2 GiB, like an application)
         case 7: return heap_size() + 0x4000000;
         case 8: return 0;  // IsCurrentProcessBeingDebugged
         case 9: return 0;  // ResourceLimit handle
         case 10: return 0;  // IdleTickCount
         case 11: return 0x1234567890ABCDEFull ^ sub;  // RandomEntropy
-        case 12: return kAddressSpaceBase;
-        case 13: return kAddressSpaceSize;
-        case 14: return kStackBase;
-        case 15: return kStackSize;
+        case 12: return g_layout.space_base;
+        case 13: return g_layout.space_size;
+        case 14: return g_layout.stack_base;
+        case 15: return g_layout.stack_size;
         case 16: return game::kInfo.system_resource_size;  // SystemResourceSizeTotal
         case 17: return 0;
         case 18: return game::kInfo.program_id;  // ProgramId

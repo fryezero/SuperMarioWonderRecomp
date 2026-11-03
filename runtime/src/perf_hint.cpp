@@ -4,7 +4,12 @@
 // clocks when a frame runs late instead of guessing from load, which on phones keeps a steady 60 fps cooler and faster
 // than the default governor. The API is looked up with dlsym, so older Android versions just go without.
 // NX_ADPF=0: off. Other platforms: nothing.
+// Also the default plat::vsync_source: no display vsync (iOS has one, platform_ios.mm).
 #include "platform.h"
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 #if defined(__ANDROID__)
 #include <dlfcn.h>
@@ -120,6 +125,10 @@ void perf_hint_frame(int64_t ns) {
 void gpu_turbo() {}
 void perf_hint_thread() {}
 void perf_hint_frame(int64_t) {}
+#endif
+
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
+bool vsync_source(void (*)(uint64_t)) { return false; }
 #endif
 
 }  // namespace nx::plat

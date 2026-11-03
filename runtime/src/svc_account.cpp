@@ -107,4 +107,12 @@ ServiceRegistrar r_acc_u1("acc:u1", [] { auto s = std::make_shared<Service>("acc
 
 }  // namespace
 
+// New in Wonder 1.2.1 (main+59e120): users "pushed" to the application when another one hands over to it (the sdk
+// asks acc:u0 ListPushedOpenUsers). Nobody hands over here; the caller then opens the preselected user as before.
+static void PopOpenUsers(CPU& c) {  // (int* count, UserHandle* users, int max) -> Result
+    if (c.x[0]) st<int32_t>(c.x[0], 0);
+    c.x[0] = 0;
+}
+NX_HLE("_ZN2nn7account12PopOpenUsersEPiPNS0_10UserHandleEi", PopOpenUsers);
+
 }  // namespace nx

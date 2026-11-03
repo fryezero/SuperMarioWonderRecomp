@@ -3,8 +3,8 @@
 //
 // First version: every submit is recorded into one Vulkan command buffer and waited for (NX_PIPELINED, NX_ASYNC_GPU:
 // into a slot's, not waited for, nvn_frames.cpp); image layouts are tracked per image, in submission order. The image
-// behind a texture is nvn_image.cpp. On macOS this is MoltenVK: the instance enumerates portability drivers and the
-// device enables VK_KHR_portability_subset.
+// behind a texture is nvn_image.cpp. On macOS and iOS this is MoltenVK: the instance enumerates portability drivers
+// where a loader offers them (macOS; iOS links MoltenVK itself) and the device enables VK_KHR_portability_subset.
 #if !defined(_WIN32)
 #include <unistd.h>  // _exit (stdlib.h on Windows)
 #endif
@@ -14,12 +14,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
 #include <vector>
 
 #include "nvn_vk.h"
+#include "phone.h"
 #include "platform.h"
 
 #include <nx/game.h>
@@ -28,6 +30,12 @@ namespace nx::nvn {
 
 using namespace nx::vk;
 
+bool gpu_resumed(bool wait);  // nvn_queue.cpp: the GPU's lifecycle
+bool gpu_enter(bool wait);
+void gpu_leave();
+// nvn_present.cpp: the swapchain's present mode, and the images to ask for.
+VkPresentModeKHR present_mode(VkPhysicalDevice physical, VkSurfaceKHR surface, const VkSurfaceCapabilitiesKHR& caps,
+                              uint32_t& images);
 
 namespace {
 
@@ -67,6 +75,25 @@ PFN_vkEnumerateInstanceExtensionProperties p_enum_instance_ext = nullptr;
 PFN_vkCreateInstance p_create_instance = nullptr;
 PFN_vkEnumeratePhysicalDevices p_enum_physical = nullptr;
 PFN_vkCreateDevice p_create_device = nullptr;
+
+// The GPU lock, held as a user of the GPU (gpu_lifecycle.h, nvn_queue.cpp) by gpu_submit, which waits while the GPU is
+// suspended, and gpu_present, which is skipped then. The wait comes before the lock and the thread is a user only once
+// it holds the lock: gpu_suspend waits for the users, and the lock's holder may be waiting for the main thread or the
+// resume (make_surface).
+struct GpuUse {
+    std::unique_lock<std::recursive_mutex> lk;
+    bool in = false;
+    explicit GpuUse(bool wait) {
+        while (!in && gpu_resumed(wait)) {
+            lk = std::unique_lock(g_gpu);
+            in = gpu_enter(false);
+            if (!in) lk.unlock();
+        }
+    }
+    ~GpuUse() {
+        if (in) gpu_leave();
+    }
+};
 
 }  // namespace
 
@@ -235,9 +262,10 @@ bool init() {
     p_vkCreateSemaphore(g_device, &sci, nullptr, &g_acquired);
     p_vkCreateSemaphore(g_device, &sci, nullptr, &g_rendered);
 
-    // A busy submit reached 67 MB (uniforms padded to 4 KB, storage to 64 KB). Android: 128 MB, half, for an 8 GB
-    // phone (docs/nvn/android-perf/MEMORY.md: the phone never filled it; big uploads have staging buffers, #72).
-#if defined(__ANDROID__)
+    // A busy submit reached 67 MB (uniforms padded to 4 KB, storage to 64 KB). Phones: 128 MB, half, for an 8 GB
+    // phone (docs/nvn/android-perf/MEMORY.md: the phone never filled it; big uploads have staging buffers, #72), and
+    // iOS ends an app at its memory limit (about 6 GB with the increased-memory-limit entitlement).
+#if NX_PHONE
     make_upload_buffer(128ull << 20);
 #else
     make_upload_buffer(256ull << 20);
@@ -262,10 +290,16 @@ bool make_surface() {
     if (g_surface) p_vkDestroySurfaceKHR(g_instance, g_surface, nullptr);
     if (g_window) plat::release_window(g_window);
     g_surface = VK_NULL_HANDLE;
+    // The platform's window and its surface may wait for the main thread (and for the app to be active), where
+    // gpu_suspend waits for the GPU's users: this is no user meanwhile, and uses the GPU again once it is resumed. It
+    // waits for that with the GPU lock held, which holds up only threads waiting for the lock, none of them a user.
+    gpu_leave();
     g_window = plat::create_window();  // waits for a window (Android); the generation is read once it is there
     g_window_gen = plat::window_generation();
     uint64_t surface = 0;
-    if (!check(VkResult(plat::vulkan_create_surface(g_instance, g_window, &surface, g_gipa)), "surface")) return false;
+    VkResult made = VkResult(plat::vulkan_create_surface(g_instance, g_window, &surface, g_gipa));
+    gpu_enter(true);
+    if (!check(made, "surface")) return false;
     g_surface = reinterpret_cast<VkSurfaceKHR>(surface);
     uint32_t n = 0;
     p_vkGetPhysicalDeviceSurfaceFormatsKHR(g_physical, g_surface, &n, nullptr);
@@ -303,8 +337,6 @@ bool make_swapchain() {
     if (!extent.width || !extent.height) return false;  // minimized
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = g_surface;
-    ci.minImageCount = std::max(caps.minImageCount, 3u);
-    if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
     ci.imageFormat = g_sc_format;
     ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     ci.imageExtent = extent;
@@ -336,24 +368,7 @@ bool make_swapchain() {
         extent.width, extent.height, caps.currentExtent.width, caps.currentExtent.height, unsigned(caps.currentTransform),
         caps.supportedTransforms, unsigned(ci.compositeAlpha), caps.supportedCompositeAlpha,
         caps.supportedUsageFlags);
-    // The game paces itself on its vsync event (hle_vi.cpp, 60 Hz): a FIFO present also waited for the display's own
-    // refresh, two clocks drifting against each other (stutter near 60 fps, docs/nvn/DEBUG.md #33). MAILBOX never
-    // blocks and shows the newest frame at each refresh; else IMMEDIATE (MoltenVK: no display sync in the Metal
-    // layer, the macOS compositor still shows whole frames at its refresh), FIFO last. NX_FIFO=1: FIFO (DEBUG.md #62).
-    ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-    uint32_t modes_n = 0;
-    p_vkGetPhysicalDeviceSurfacePresentModesKHR(g_physical, g_surface, &modes_n, nullptr);
-    std::vector<VkPresentModeKHR> modes(modes_n);
-    p_vkGetPhysicalDeviceSurfacePresentModesKHR(g_physical, g_surface, &modes_n, modes.data());
-    auto has = [&](VkPresentModeKHR m) { return std::find(modes.begin(), modes.end(), m) != modes.end(); };
-    if (!std::getenv("NX_FIFO")) {
-        if (has(VK_PRESENT_MODE_MAILBOX_KHR))
-            ci.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
-        else if (has(VK_PRESENT_MODE_IMMEDIATE_KHR))
-            ci.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-    }
-    static const char* const mode_names[] = {"IMMEDIATE", "MAILBOX", "FIFO", "FIFO_RELAXED"};
-    log("nvn/vk: present mode %s (%u modes offered)", ci.presentMode <= 3 ? mode_names[ci.presentMode] : "?", modes_n);
+    ci.presentMode = present_mode(g_physical, g_surface, caps, ci.minImageCount);
     ci.clipped = VK_TRUE;
     if (!check(p_vkCreateSwapchainKHR(g_device, &ci, nullptr, &g_swapchain), "vkCreateSwapchainKHR")) return false;
     uint32_t n = 0;
@@ -529,8 +544,8 @@ std::shared_ptr<const DeferredValues> g_deferred;  // the submit being replayed 
 const DeferredValues* current_deferred() { return g_deferred.get(); }
 
 void gpu_submit(const std::vector<std::shared_ptr<CmdList>>& lists, std::shared_ptr<const DeferredValues> deferred) {
+    GpuUse gpu(true);  // the GPU lock, once the GPU is not suspended
     g_deferred = std::move(deferred);
-    std::lock_guard lk(g_gpu);
     uint64_t t_in = plat::monotonic_ns();
     const FrameTimes f_in = frame_times();
     uint64_t lists_epoch = 0;
@@ -606,7 +621,8 @@ void present_headless(uint64_t texture) {
 
 void gpu_present(uint64_t texture, const int32_t* crop) {
     plat::perf_hint_thread();  // the thread that presents takes part in the frame (perf_hint.cpp)
-    std::lock_guard lk(g_gpu);
+    GpuUse gpu(false);  // the GPU lock
+    if (!gpu.in) return;  // the GPU is suspended: the frame is not shown
     PresentTimer timer;
     drain_objects();  // under the GPU lock, as in gpu_submit
     if (!init()) return;

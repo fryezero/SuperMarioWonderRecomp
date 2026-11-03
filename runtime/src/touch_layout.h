@@ -1,4 +1,4 @@
-// Drawn touch controls: the per-game button layout (touch_layout.cpp).
+// Drawn touch controls: the per-game button layout (touch_layout.cpp), hit-tested and drawn by touch_controls.cpp.
 #pragma once
 
 #include <cstddef>

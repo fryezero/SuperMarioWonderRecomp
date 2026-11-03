@@ -23,6 +23,33 @@ NVN implemented over Vulkan (MoltenVK).
 
 ## Log
 
+### 2026-11-02: Wonder 1.2.1, and the iPhone at 60 fps
+
+The track moves to the 1.2.1 update and gets a fifth host, iOS (docs/IOS.md).
+
+- **1.2.1** (patch v327680, SDK 16.2.12): the recompiler takes it unchanged (212,403 functions in `main`, 0
+  unhandled); 12,757 shader blocks translate, all valid. Its RomFS is a BKTR patch that only LibHac reads
+  (`tools/romfs_patch`). Four runtime constants were 1.0.0 offsets and all four were wrong on 1.2.1; they are now found
+  by sdk export, by code pattern and by table contents, so one build runs either version (docs/nvn/WONDER.md,
+  "Version 1.2.1"). 1.2.1 adds amiibo calls the sdk aborts on without `nfp:user` (`hle_nfp.cpp`: no reader).
+- **Address space.** On iOS 27 an app with the increased-memory-limit entitlement (which a free Apple ID may sign)
+  can map 0x70..0x80_0000_0000 and nothing else of use; macOS 27 has the same window, with a 24 GiB heap range at a
+  random place in it. The modules move to 0x7F_E000_0000 and `memory_init` places the other regions at run time
+  (`GuestLayout`), with the ASLR region narrowed to them.
+- **iOS front end**: UIKit with the UIScene lifecycle (required by the iOS 27 SDK), a CAMetalLayer at 2x, static
+  MoltenVK, vsync and present pacing from a CADisplayLink (MoltenVK offers only FIFO there), GameController pads and
+  the Android touch controls (now `touch_controls.cpp`), RemoteIO audio, GPU work suspended while the app is not
+  active. The POSIX/Mach half of the Mac layer is shared (`platform_darwin.cpp`).
+- **Measured on the iPhone 18 Pro Max**: title and menus at 60; course 1-1 through a 30-minute soak at a median of
+  60.0 in every 5 minutes, 97.2% of present intervals within 14-19 ms, thermal nominal (briefly fair), 3.3-3.5 GB.
+- **First-encounter stutter**: every miss was a Metal pipeline compile (1,754 in 20 s on the first run, up to 8.3 s at
+  once when the course starts). Pipelines are now captured device-independently (`pipeline_capture.bin`) and, at the
+  next start, rebuilt by a warm-up thread and handed to the replay as it asks for them
+  (`nvn_pipeline_capture.cpp`, `nvn_pipeline_warm.cpp`); a capture made on the Mac seeds the phone. A fresh install's
+  first start on the phone now holds 57.2 fps at worst through the course-1-1 script (was 6.3), the replay spending
+  75 ms on pipelines instead of 20 s.
+
+
 ### 2026-09-30 (night): Wonder boots on Android; W8 fixes; Windows plan
 
 ![World map with the player](docs/media/wonder/39-world-map-player.png)

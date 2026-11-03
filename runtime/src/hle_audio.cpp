@@ -179,8 +179,19 @@ void CreateAudioRendererManagerByHipc(CPU& c) {
 // the frame's commands and runs the sdk's own DSP command processor on the calling thread, and its render system
 // (impl + 0x60) signals its own event, which has no kernel object in process. A guest thread of ours renders every
 // 5 ms and signals the game's event itself, then sends the frame's final mix to the host device.
-constexpr uint64_t kRendererVtable = 0xd04910;     // sdk: vtable of the sf object wrapping AudioRendererImpl
-constexpr uint64_t kExecuteRendering = 0x20cac8;   // sdk: AudioRendererImpl::ExecuteAudioRendererRendering
+// Both are sdk exports (1.0.0 sdk+d04910 / +20cac8, 1.2.1 sdk+d05910 / +20cc48).
+constexpr const char* kRendererVtable =  // vtable of the sf object wrapping AudioRendererImpl
+    "_ZTVN2nn2sf6detail38ObjectImplFactoryWithStatefulAllocatorINS0_13InterfaceInfoINS_5audio6detail14IAudioRendererEE4_"
+    "tABINS7_5_tO2NINS4_6server24AudioRendererManagerImpl17AudioRendererImplEE4typeES6_E4typeENS0_24StatefulAllocation"
+    "PolicyINS0_16ExpHeapAllocatorEEEE6ObjectE";
+constexpr const char* kExecuteRendering =
+    "_ZN2nn5audio6server24AudioRendererManagerImpl17AudioRendererImpl29ExecuteAudioRendererRenderingEv";
+
+uint64_t sdk_export(const char* name) {
+    uint64_t a = find_symbol(name);
+    if (!a) fatal("audio: sdk export %s not found", name);
+    return a;
+}
 
 // The in-process render system hands the client a readable handle of 0 for the renderer's event (there is no
 // kernel event behind it), so the SystemEvent the game waits on is ours: an InterProcessEventType keeps its
@@ -190,19 +201,11 @@ std::shared_ptr<EventState> g_audio_frame = std::make_shared<EventState>();
 std::mutex g_renderers_lock;
 std::vector<uint64_t> g_renderers;  // AudioRendererImpl*
 
-uint64_t sdk_base() {
-    static uint64_t base = [] {
-        const LoadedModule* m = module_at(find_symbol("nvnBootstrapLoader"));
-        return m ? m->base : 0;
-    }();
-    return base;
-}
-
 // The AudioRendererImpl behind an AudioRendererHandle: an sf object whose vtable pointer is that one, within two
 // pointer hops of the handle.
 uint64_t find_renderer(uint64_t handle) {
-    uint64_t vptr = sdk_base() + kRendererVtable + 0x10;
-    auto valid = [](uint64_t p) { return p >= kModuleBase && p < kKernelBase + kKernelSize && (p & 7) == 0; };
+    static const uint64_t vptr = sdk_export(kRendererVtable) + 0x10;
+    auto valid = [](uint64_t p) { return is_guest(p) && (p & 7) == 0; };
     for (uint64_t a = 0; a < 0x40; a += 8) {
         uint64_t p = ld<uint64_t>(handle + a);
         if (!valid(p)) continue;
@@ -395,7 +398,10 @@ void render_submit() {
     o.held.push_back(k);
     if (o.priming && o.held.size() < kPrime) return;
     o.priming = false;
-    for (int h : o.held) plat::audio_submit(o.blocks[h], sizeof pcm, o.blocks[h]);
+    // A block the device refuses (iOS: the app in the background, the output stopped) goes straight back to the free
+    // list: nothing would ever hand it back, and with every block lost the sound would not come back.
+    for (int h : o.held)
+        if (!plat::audio_submit(o.blocks[h], sizeof pcm, o.blocks[h])) o.free.push_back(h), o.dropped++;
     o.held.clear();
 }
 
@@ -404,7 +410,12 @@ void audio_render_thread(CPU& c) {
     uint64_t next = plat::monotonic_ns();
     for (;;) {
         next += 5'000'000;
-        int64_t wait = int64_t(next - plat::monotonic_ns());
+        uint64_t now = plat::monotonic_ns();
+        // After a stall (iOS suspends the whole process in the background while this clock keeps running; a
+        // debugger) the missed frames are dropped, not rendered back to back: minutes away would otherwise come back
+        // as tens of thousands of renders in a row, fast-forwarded sound and the game's threads starved.
+        if (int64_t(now - next) > 50'000'000) next = now;
+        int64_t wait = int64_t(next - now);
         if (wait > 0) plat::sleep_ns(wait);
         std::vector<uint64_t> list;
         {
@@ -418,7 +429,8 @@ void audio_render_thread(CPU& c) {
             std::memcpy(saved, c.x, sizeof saved);
             c.x[0] = impl;
             std::lock_guard lk(g_render_system);
-            call(c, sdk_base() + kExecuteRendering);
+            static const uint64_t execute = sdk_export(kExecuteRendering);
+            call(c, execute);
             last_rc = c.x[0];
             std::memcpy(c.x, saved, sizeof saved);
             std::lock_guard pk(g_pace_lock);  // counted under the render lock (AudioRenderSystemUpdate)

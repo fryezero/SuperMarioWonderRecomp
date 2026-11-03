@@ -4,7 +4,8 @@
 // NX_PIPELINED the GPU work is in flight when a submit returns but its compute results are in guest memory, so
 // syncs and nvnQueueFinish have nothing to wait for, as synchronously (gpu_serial() is 0). Return
 // values follow the SDK driver (nvnSyncWait sdk+45a960: 0 once the fence has passed; nvnWindowAcquireTexture
-// sdk+45e050: 0 on success).
+// sdk+45e050: 0 on success). Also the GPU's lifecycle (gpu_lifecycle.h): while an iOS app is not in the foreground,
+// submits wait and presents are skipped.
 #include <algorithm>
 #include <mutex>
 #include <condition_variable>
@@ -17,8 +18,12 @@
 #include <atomic>
 #include <vector>
 
+#include "gpu_lifecycle.h"
 #include "nvn.h"
+#include "nvn_vk.h"
+#include "phone.h"
 #include "platform.h"
+#include "vsync.h"
 
 namespace nx::nvn {
 
@@ -54,7 +59,8 @@ struct WaitSite {
 };
 WaitSite g_wait_sites[kWaitSites] = {{"sync wait"}, {"queue finish"}, {"pool invalidate"}, {"pool finalize"}};
 
-// Waits until the submits up to `seq` were replayed (2 s at most: a hung replay is logged, not waited forever).
+// Waits until the submits up to `seq` were replayed (2 s at most: a hung replay is logged, not waited forever). A
+// submit held while the GPU is suspended (gpu_lifecycle.h) is not hung: the 2 s start again after a suspension.
 void wait_submits(uint64_t seq, int site) {
     if (sync_loose() || !seq) return;
     WaitSite& w = g_wait_sites[site];
@@ -63,10 +69,17 @@ void wait_submits(uint64_t seq, int site) {
     if (g_sub_done >= seq) return;
     uint64_t n = ++g_sub_blocked;
     if (n == 1 || n % 1000 == 0) log("nvn: %llu CPU waits blocked on a submit still being replayed", (unsigned long long)n);
-    uint64_t t0 = plat::monotonic_ns();
-    if (!g_sub_cv.wait_for(lk, std::chrono::seconds(2), [seq] { return g_sub_done >= seq; }))
+    uint64_t t0 = plat::monotonic_ns(), epoch = gpu_lifecycle_epoch();
+    while (!g_sub_cv.wait_for(lk, std::chrono::seconds(2), [seq] { return g_sub_done >= seq; })) {
+        uint64_t e = gpu_lifecycle_epoch();
+        if (e & 1 || e != epoch) {
+            epoch = e;
+            continue;
+        }
         log("nvn: a CPU wait gave up after 2 s on submit %llu (%llu done)", (unsigned long long)seq,
             (unsigned long long)g_sub_done);
+        break;
+    }
     uint64_t dt = plat::monotonic_ns() - t0;
     w.blocked++, w.ns += dt, w.frame_ns += dt;
 }
@@ -227,7 +240,7 @@ void WindowGetPresentInterval(CPU& c) {
     c.x[0] = w ? uint64_t(w->interval) : 1;
 }
 
-// Our governor over the game's (NX_GOVERNOR; on by default on Android unless NX_MAX_INTERVAL is set). The game's own
+// Our governor over the game's (NX_GOVERNOR; on by default on phones unless NX_MAX_INTERVAL is set). The game's own
 // rule (below) locks 30 fps after 3 frames over 15.83 ms; at 30 fps a phone lowers its clocks, every frame then takes
 // longer, and it never leaves 30 (a Galaxy S23 sat at 30 fps in course with frames that run at 60 when allowed).
 // This one holds 60 (the game's maximum clamped to 1) while it is kept: it watches the main thread's loop period over
@@ -238,7 +251,7 @@ void WindowGetPresentInterval(CPU& c) {
 uint32_t governor_max(uint64_t now) {
     static const bool on = [] {
         const char* e = std::getenv("NX_GOVERNOR");
-#if defined(__ANDROID__)
+#if NX_PHONE
         return !(e && e[0] == '0');
 #else
         return e && e[0] == '1';
@@ -271,14 +284,32 @@ uint32_t governor_max(uint64_t now) {
     return 0;
 }
 
-// Wonder's sead::GameFramework::procFrame_ override (main+e15ec) picks the interval every frame from the main
-// thread's last frame time, fw[0x118] (GetSystemTick ticks from the end of the previous present wait to the end of
-// this frame's calc and draw recording): 2 when it reaches 15.83 ms, locked after 3 slow frames, back to 1 after 15
-// fast ones (docs/nvn/DEBUG.md #43). From that call site (lr main+e16ac, x19 = the framework): a histogram of that
-// time every 600 frames, and NX_MAX_INTERVAL=1 clamps the game's own maximum to 1 (fields 0x24c/0x264/0x268).
+// Wonder's sead::GameFramework::procFrame_ override (1.0.0 main+e15ec, 1.2.1 main+cfd24) picks the interval every
+// frame from the main thread's last frame time, fw[0x118] (GetSystemTick ticks from the end of the previous present
+// wait to the end of this frame's calc and draw recording): 2 when it reaches 15.83 ms, locked after 3 slow frames,
+// back to 1 after 15 fast ones (docs/nvn/DEBUG.md #43). The call site is recognised by its code, which is the same in
+// both versions except the adrp page and the NVN slot's offset (lr 1.0.0 main+e16ac, 1.2.1 main+cfde4; x19 = the
+// framework): str w20,[x19,#0x260]; ldr x8,[x19,#0x140]; strb w20,[x8,#0x58]; ldr x0,[x8,#0x20]; cbz x0,lr;
+// adrp x8; and w1,w20,#0xff; ldr x8,[x8,#slot]; blr x8 | lr: ldr s0,[x19,#0x260].
+// From there: a histogram of that time every 600 frames, and NX_MAX_INTERVAL=1 clamps the game's own maximum to 1
+// (fields 0x24c/0x264/0x268).
+bool is_proc_frame_call(uint64_t lr) {
+    static constexpr uint32_t kWant[10] = {0xb9026274, 0xf940a268, 0x39016114, 0xf9401100, 0xb40000a0,
+                                           0x90000008, 0x12001e81, 0xf9400108, 0xd63f0100, 0xbd426260};
+    static constexpr uint32_t kMask[10] = {~0u, ~0u, ~0u, ~0u, ~0u, 0x9F00001Fu, ~0u, 0xFFC003FFu, ~0u, ~0u};
+    static std::atomic<uint64_t> site{0};
+    if (lr == site.load(std::memory_order_relaxed)) return true;
+    const LoadedModule* m = module_at(lr);
+    if (!m || lr - m->base < m->info->text + 0x24 || lr - m->base >= m->info->text + m->info->text_size) return false;
+    for (int i = 0; i < 10; i++)
+        if ((ld<uint32_t>(lr - 0x24 + 4 * i) & kMask[i]) != kWant[i]) return false;
+    if (!site.exchange(lr)) log("nvn: procFrame_ present-interval call found at %s+%llx", m->info->name,
+                                (unsigned long long)(lr - m->base));
+    return true;
+}
+
 void frame_time_probe(CPU& c) {
-    const LoadedModule* m = module_at(c.x[30]);
-    if (!m || c.x[30] - m->base != 0xe16ac || !c.x[19]) return;
+    if (!c.x[19] || !is_proc_frame_call(c.x[30])) return;
     plat::perf_hint_thread();  // the game's main thread makes the frame too (ADPF, PLAN.md R2)
     plat::frame_thread_tick(1);
     static const char* max_env = std::getenv("NX_MAX_INTERVAL");
@@ -336,6 +367,20 @@ void WindowSetPresentInterval(CPU& c) {
     }
 }
 
+// With the display's vsync (vsync.h; iOS) a pacing target moves to the nearest vsync of the display's own timeline: the
+// game's pacing, its vsync event (hle_vi.cpp) and the FIFO swapchain then follow one clock. The free-running grid
+// drifts against the display, and a frame then now and then waits a refresh more or less in the swapchain (the two
+// clocks of docs/nvn/DEBUG.md #33). Not while the display's vsync is stale (four refreshes without one: the app is in
+// the background), nor without it: the target stays as it is.
+uint64_t on_display_timeline(uint64_t t, uint64_t now) {
+    uint64_t v = display_vsync_ns();
+    if (!v || int64_t(now - v) > int64_t(4 * kVsyncNs) || int64_t(t - v) < 0) return t;
+    static bool logged = false;
+    if (!logged) log("nvn: presents paced on the display's vsync");
+    logged = true;
+    return v + (t - v + kVsyncNs / 2) / kVsyncNs * kVsyncNs;
+}
+
 // (NVNqueue*, NVNwindow*, int textureIndex)
 // Frame pacing: a present returns no earlier than the window's present interval (in 60 Hz vsyncs) after the previous
 // one. On the Switch the texture-available sync of the next acquire does this; ours is signaled at once, so without
@@ -351,8 +396,8 @@ void pace_present(int interval) {
     at2 += interval >= 2;
     if (++presents % 600 == 0)
         log("nvn: %llu of the last 600 presents at interval >= 2", (unsigned long long)at2), at2 = 0, log_wait_sites();
-    uint64_t period = uint64_t(interval) * 16'666'667ull;
-    next = (next > now || now - next < period ? next : now) + period;
+    uint64_t period = uint64_t(interval) * kVsyncNs;
+    next = on_display_timeline((next > now || now - next < period ? next : now) + period, now);
 }
 
 void QueuePresentTexture(CPU& c) {
@@ -416,4 +461,77 @@ NX_HLE("nvnWindowSetNumActiveTextures", WindowSetNumActiveTextures);
 NX_HLE("nvnWindowGetPresentInterval", WindowGetPresentInterval);
 NX_HLE("nvnWindowSetPresentInterval", WindowSetPresentInterval);
 
+// ---- the GPU's lifecycle (gpu_lifecycle.h) ------------------------------------------------------------------------
+
+// gpu_submit and gpu_present (nvn_vk.cpp) are the GPU's users while they hold the GPU lock, and gpu_suspend waits for
+// the users, never for that lock. They wait for the resume before they take the lock and become users only once they
+// hold it: a thread still waiting for the lock is no user, because the lock's holder may itself be waiting for the
+// platform's window, which may need the main thread gpu_suspend runs on, or for the resume (make_surface, no user
+// meanwhile). Counted from before the lock, such a waiter held up gpu_suspend, and the holder then waited for a resume
+// the blocked main thread could not send.
+namespace {
+struct Lifecycle {
+    std::mutex lock;
+    std::condition_variable cv;
+    std::atomic<uint64_t> epoch{0};  // gpu_lifecycle_epoch(): odd while suspended; changed under the lock
+    int users = 0;
+} g_life;
+}  // namespace
+
+// Waits while the GPU is suspended (`wait`); false: it is suspended and was not waited for.
+bool gpu_resumed(bool wait) {
+    std::unique_lock lk(g_life.lock);
+    if (wait) g_life.cv.wait(lk, [] { return !(g_life.epoch & 1); });
+    return !(g_life.epoch & 1);
+}
+
+// Becomes a user, waiting while the GPU is suspended (`wait`) or not (false: suspended, no user). The caller holds the
+// GPU lock.
+bool gpu_enter(bool wait) {
+    std::unique_lock lk(g_life.lock);
+    if (wait) g_life.cv.wait(lk, [] { return !(g_life.epoch & 1); });
+    if (g_life.epoch & 1) return false;
+    g_life.users++;
+    return true;
+}
+
+void gpu_leave() {
+    {
+        std::lock_guard lk(g_life.lock);
+        g_life.users--;
+    }
+    g_life.cv.notify_all();
+}
+
 }  // namespace nx::nvn
+
+namespace nx {
+
+void gpu_suspend() {
+    auto& life = nvn::g_life;
+    std::unique_lock lk(life.lock);
+    if (life.epoch & 1) return;
+    life.epoch++;
+    life.cv.wait(lk, [&] { return life.users == 0; });
+    // No submit or present runs and none starts: what was queued is all there is. MoltenVK waits for it with an empty
+    // command buffer of its own, which iOS still runs while the scene resigns active (it refuses them in the
+    // background). The lock is kept: a gpu_resume meanwhile would let a submit use the queue during the wait.
+    uint64_t t0 = plat::monotonic_ns();
+    if (VkDevice d = nvn::vk_device()) vk::p_vkDeviceWaitIdle(d);
+    log("nvn/vk: GPU suspended (%.1f ms to finish its work)", double(plat::monotonic_ns() - t0) / 1e6);
+}
+
+void gpu_resume() {
+    auto& life = nvn::g_life;
+    {
+        std::lock_guard lk(life.lock);
+        if (!(life.epoch & 1)) return;
+        life.epoch++;
+    }
+    life.cv.notify_all();
+    log("nvn/vk: GPU resumed");
+}
+
+uint64_t gpu_lifecycle_epoch() { return nvn::g_life.epoch.load(); }
+
+}  // namespace nx

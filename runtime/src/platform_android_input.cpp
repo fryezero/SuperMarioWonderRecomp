@@ -31,7 +31,6 @@
 #include <fstream>
 #include <mutex>
 #include <string>
-#include <vector>
 
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_ANDROID_KHR
@@ -43,28 +42,19 @@
 #include "kernel.h"
 #include "platform.h"
 #include "platform_android.h"
-#include "touch_layout.h"
+#include "touch_controls.h"
 
 // Android input: game controllers and touch (split from platform_android.cpp).
 namespace nx::plat {
 
 // ---- input: game controllers + touch --------------------------------------------------------------------------
-// Touch: left half = virtual stick (relative to where the finger went down); right half = four buttons in a
-// diamond around the thumb (Y attack up-left, X special up-right, B dash down-left, A interact down-right), top
-// corners L / R, top centre +.
+// Touch: each pointer of a touchscreen event goes to touch_controls.cpp (the stick, the buttons, the overlay), in
+// window pixels.
 
 namespace {
 std::mutex g_in;
 PadState g_pad_buttons;  // controller state
-struct Touch {
-    int32_t id;
-    float x0, y0, x, y;
-    bool left;
-    uint64_t button;
-};
-std::vector<Touch> g_touches;
-float g_w = 1, g_h = 1;
-bool g_gamepad = false;  // the last input came from a controller: the drawn touch controls hide
+float g_w = 1, g_h = 1;  // the window's size at the last touchscreen event
 
 uint64_t key_to_button(int32_t k) {
     switch (k) {
@@ -89,14 +79,6 @@ uint64_t key_to_button(int32_t k) {
     }
 }
 
-uint64_t touch_button(float x, float y) {
-    float nx_ = x / g_w, ny = y / g_h;
-    if (ny < 0.2f) return nx_ < 0.6f ? (nx_ < 0.45f ? kL : kPlus) : (nx_ > 0.85f ? kR : kZR);
-    bool up = ny < 0.6f, right = nx_ > 0.8f;
-    if (up) return right ? kX : kY;
-    return right ? kA : kB;
-}
-
 }  // namespace
 
 int32_t on_input(android_app*, AInputEvent* e) {
@@ -106,7 +88,7 @@ int32_t on_input(android_app*, AInputEvent* e) {
     if (type == AINPUT_EVENT_TYPE_KEY) {
         uint64_t b = key_to_button(AKeyEvent_getKeyCode(e));
         if (!b) return 0;
-        g_gamepad = true;
+        touch::set_gamepad_active(true);
         if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_DOWN)
             g_pad_buttons.buttons |= b;
         else if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_UP)
@@ -115,7 +97,7 @@ int32_t on_input(android_app*, AInputEvent* e) {
     }
     if (type != AINPUT_EVENT_TYPE_MOTION) return 0;
     if ((src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK) {
-        g_gamepad = true;
+        touch::set_gamepad_active(true);
         auto axis = [&](int32_t a) {
             float v = AMotionEvent_getAxisValue(e, a, 0);
             return std::fabs(v) < 0.15f ? 0 : int32_t(std::clamp(v, -1.f, 1.f) * kStickMax);
@@ -147,34 +129,18 @@ int32_t on_input(android_app*, AInputEvent* e) {
         g_w = float(ANativeWindow_getWidth(w));
         g_h = float(ANativeWindow_getHeight(w));
     }
+    auto feed = [&](size_t k, touch::Phase phase) {
+        touch::feed(AMotionEvent_getPointerId(e, k), AMotionEvent_getX(e, k), AMotionEvent_getY(e, k), phase, g_w, g_h);
+    };
     if (kind == AMOTION_EVENT_ACTION_DOWN || kind == AMOTION_EVENT_ACTION_POINTER_DOWN) {
-        float x = AMotionEvent_getX(e, index), y = AMotionEvent_getY(e, index);
-        g_gamepad = false;
-        size_t drawn = 0;
-        touch_buttons(drawn);
-        if (drawn) {  // a drawn layout (touch_layout.cpp): its buttons first, the rest of the left half is the stick
-            uint64_t b = touch_hit(x / g_w, y / g_h, g_w / g_h);
-            bool left = !b && x < g_w * 0.5f;
-            if (b || left) g_touches.push_back({AMotionEvent_getPointerId(e, index), x, y, x, y, left, b});
-        } else {
-            bool left = x < g_w * 0.5f;
-            g_touches.push_back({AMotionEvent_getPointerId(e, index), x, y, x, y, left, left ? 0 : touch_button(x, y)});
-        }
+        feed(index, touch::Phase::Down);
     } else if (kind == AMOTION_EVENT_ACTION_UP || kind == AMOTION_EVENT_ACTION_POINTER_UP ||
                kind == AMOTION_EVENT_ACTION_CANCEL) {
-        int32_t id = AMotionEvent_getPointerId(e, index);
-        if (kind == AMOTION_EVENT_ACTION_UP || kind == AMOTION_EVENT_ACTION_CANCEL) g_touches.clear();
-        g_touches.erase(std::remove_if(g_touches.begin(), g_touches.end(), [&](const Touch& t) { return t.id == id; }),
-                        g_touches.end());
+        feed(index, touch::Phase::Up);
+        // The last finger up or a cancelled gesture: no finger is down any more, not even one whose up was lost.
+        if (kind == AMOTION_EVENT_ACTION_UP || kind == AMOTION_EVENT_ACTION_CANCEL) touch::release_all();
     } else if (kind == AMOTION_EVENT_ACTION_MOVE) {
-        for (size_t k = 0; k < AMotionEvent_getPointerCount(e); k++) {
-            int32_t id = AMotionEvent_getPointerId(e, k);
-            for (auto& t : g_touches)
-                if (t.id == id) {
-                    t.x = AMotionEvent_getX(e, k);
-                    t.y = AMotionEvent_getY(e, k);
-                }
-        }
+        for (size_t k = 0; k < AMotionEvent_getPointerCount(e); k++) feed(k, touch::Phase::Move);
     }
     return 1;
 }
@@ -193,48 +159,8 @@ void read_pad(PadState& p) {
     }
     p.rx = g_pad_buttons.rx;
     p.ry = g_pad_buttons.ry;
-    float radius = std::max(1.f, g_h * 0.12f);
-    size_t drawn = 0;
-    touch_buttons(drawn);
-    for (const auto& t : g_touches) {
-        if (t.left) {
-            float dx = (t.x - t.x0) / radius, dy = (t.y - t.y0) / radius;
-            p.lx = int32_t(std::clamp(dx, -1.f, 1.f) * kStickMax);
-            p.ly = int32_t(std::clamp(-dy, -1.f, 1.f) * kStickMax);
-            // A drawn layout's stick pushed nearly all the way holds Y too (Wonder: dash), so running needs no second
-            // thumb on the right side.
-            if (drawn && std::abs(dx) > 0.85f) p.buttons |= kY;
-        } else {
-            p.buttons |= t.button;
-        }
-    }
+    touch::merge(p);
     input_script(p);  // NX_INPUT_SCRIPT (config.txt): scripted runs on the phone, as on the Mac
-}
-
-// The drawn layout's buttons (brighter while pressed) and the stick under the thumb; nothing while a controller is
-// in use or for games without a drawn layout.
-size_t touch_overlay(OverlayShape* out, size_t max) {
-    size_t n = 0, k = 0;
-    const TouchButton* b = touch_buttons(n);
-    if (!n) return 0;
-    std::lock_guard lk(g_in);
-    if (g_gamepad) return 0;
-    const Touch* stick = nullptr;
-    uint64_t held = 0;
-    for (const auto& t : g_touches) {
-        if (t.left) stick = &t;
-        held |= t.button;
-    }
-    for (size_t i = 0; i < n && k < max; i++) out[k++] = {b[i].x, b[i].y, b[i].r, held & b[i].button ? 0.5f : 0.2f};
-    if (stick && k + 2 <= max) {
-        float r = 0.12f, dx = (stick->x - stick->x0) / g_h, dy = (stick->y - stick->y0) / g_h;
-        float len = std::hypot(dx, dy), s = len > r ? r / len : 1.f;
-        out[k++] = {stick->x0 / g_w, stick->y0 / g_h, r, 0.14f};
-        out[k++] = {(stick->x0 / g_h + dx * s) * g_h / g_w, stick->y0 / g_h + dy * s, 0.055f, 0.45f};
-    } else if (k < max) {
-        out[k++] = {0.15f, 0.72f, 0.12f, 0.08f};  // where the stick goes
-    }
-    return k;
 }
 
 }  // namespace nx::plat

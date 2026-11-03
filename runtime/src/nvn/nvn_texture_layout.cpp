@@ -2,8 +2,10 @@
 // aligned. The SDK driver computes this through its device's surface-layout object, which only its own
 // nvnDeviceInitialize (talking to the GPU kernel driver) sets up, so we compute it here: Maxwell block-linear.
 //
-// Format facts come from the driver's own format table (sdk+0xd34198 in SDK 16.2, 0x30 bytes per NVNformat):
-//   word 2: block width (byte 0), block height (byte 1); word 4: bytes per block (byte 0).
+// Format facts come from the driver's own format table (0x30 bytes per NVNformat; sdk+0xd34198 in SDK 16.2.0,
+// sdk+0xd351a8 in 16.2.12): word 2: block width (byte 0), block height (byte 1); word 4: bytes per block (byte 0).
+// It is found by its contents, so no offset per SDK build: the one 8-aligned place in the sdk image where seven
+// formats of known shape (RGBA8, RGBA32F, BC1 x2, BC7, ASTC 4x4, ASTC 12x12) have the entries they must have.
 // Block linear: the image is cut into GOBs of 64 bytes x 8 rows; GOBs stack vertically into blocks of
 // 1..16 GOBs (the block height, picked per mip level from the level's height); a level's rows of blocks are
 // 64-byte aligned in width and block-aligned in height. Pre-tiled data (BNTX) is laid out the same way, so the
@@ -16,22 +18,44 @@ namespace nx::nvn {
 
 namespace {
 
-constexpr uint64_t kFormatTable = 0xd34198;  // in sdk (SDK 16.2)
 constexpr uint32_t kFormatCount = 0xd0;
 
 struct FormatInfo {
     uint32_t block_w = 1, block_h = 1, bytes = 4;
 };
 
+uint64_t find_format_table() {
+    struct Known { uint32_t format, block_w, block_h, bytes; };
+    static constexpr Known kKnown[] = {{0x25, 1, 1, 4},  {0x2e, 1, 1, 16}, {0x41, 4, 4, 8},   {0x42, 4, 4, 8},
+                                       {0x4d, 4, 4, 16}, {0x79, 4, 4, 16}, {0x86, 12, 12, 16}};
+    const LoadedModule* m = module_at(find_symbol("nvnBootstrapLoader"));
+    if (!m) fatal("nvn: sdk module not found");
+    const uint64_t end = m->base + m->info->data + m->info->data_size - uint64_t(kFormatCount) * 0x30;
+    uint64_t found = 0;
+    for (uint64_t t = m->base + m->info->ro; t < end; t += 8) {
+        bool all = true;
+        for (const Known& k : kKnown) {
+            const uint32_t* e = reinterpret_cast<const uint32_t*>(t + uint64_t(k.format) * 0x30);
+            if ((e[2] & 0xFF) != k.block_w || ((e[2] >> 8) & 0xFF) != k.block_h || (e[4] & 0xFF) != k.bytes) {
+                all = false;
+                break;
+            }
+        }
+        if (!all) continue;
+        if (found) fatal("nvn: two format tables in the sdk (+%llx, +%llx)", (unsigned long long)(found - m->base),
+                         (unsigned long long)(t - m->base));
+        found = t;
+    }
+    if (!found) fatal("nvn: format table not found in the sdk");
+    log("nvn: format table at sdk+%llx", (unsigned long long)(found - m->base));
+    return found;
+}
+
 FormatInfo format_info(uint32_t format) {
-    static uint64_t sdk = [] {
-        uint64_t loader = find_symbol("nvnBootstrapLoader");
-        const LoadedModule* m = module_at(loader);
-        return m ? m->base : 0;
-    }();
+    static const uint64_t table = find_format_table();
     FormatInfo f;
-    if (!sdk || format >= kFormatCount) return f;
-    const uint32_t* e = reinterpret_cast<const uint32_t*>(sdk + kFormatTable + uint64_t(format) * 0x30);
+    if (format >= kFormatCount) return f;
+    const uint32_t* e = reinterpret_cast<const uint32_t*>(table + uint64_t(format) * 0x30);
     uint32_t bw = e[2] & 0xFF, bh = (e[2] >> 8) & 0xFF, bytes = e[4] & 0xFF;
     if (bw && bh && bytes) f = {bw, bh, bytes};
     return f;

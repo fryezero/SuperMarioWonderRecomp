@@ -8,12 +8,20 @@
 // So any TrueType font works: <data root>/fonts/shared_<type>.ttf (0 standard, 1 simplified Chinese, 2 its
 // extension, 3 traditional Chinese, 4 Korean, 5 Nintendo extension), else shared.ttf, else the host's own
 // (NX_SHARED_FONT, or a system font on macOS, Android and Windows). The fonts on our own firmware dump can go there once decoded.
+//
+// iOS has no system font in that list: the Mac's Arial Unicode does not ship there, and its own font files are mostly
+// .ttc collections at paths that are not an interface. tools/fonts/collect_host_fonts.py copies the fonts the Mac
+// uses into the data folder instead, so the phone renders the same text.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 #include <nx/runtime.h>
 
@@ -42,16 +50,29 @@ std::vector<uint8_t> read_file(const std::string& path) {
     return v;
 }
 
+const char* const kTypeNames[6] = {"standard", "simplified Chinese", "simplified Chinese extension",
+                                   "traditional Chinese", "Korean", "Nintendo extension"};
+
+// A single font: TrueType outlines (sfnt version 1.0 or 'true') or CFF ('OTTO'). A collection ('ttcf') starts with a
+// table of offsets to its fonts instead, which the game's engine would misread.
+bool single_font(const std::vector<uint8_t>& ttf) {
+    if (ttf.size() < 12) return false;
+    uint32_t tag = uint32_t(ttf[0]) << 24 | uint32_t(ttf[1]) << 16 | uint32_t(ttf[2]) << 8 | ttf[3];
+    return tag == 0x00010000 || tag == 0x74727565 || tag == 0x4F54544F;
+}
+
 const Font& font(uint32_t type) {
     static std::mutex lock;
     static Font fonts[6];
+    if (type >= 6) type = 0;
     std::lock_guard lk(lock);
-    Font& f = fonts[type < 6 ? type : 0];
+    Font& f = fonts[type];
     if (f.addr) return f;
     std::string root = plat::data_root() + "/fonts/";
     std::vector<std::string> candidates = {root + "shared_" + std::to_string(type) + ".ttf", root + "shared.ttf"};
     if (const char* e = std::getenv("NX_SHARED_FONT")) candidates.push_back(e);
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
+    // tools/fonts/collect_host_fonts.py copies the first of these that exists: keep the two lists the same.
     candidates.push_back("/System/Library/Fonts/Supplemental/Arial Unicode.ttf");
     candidates.push_back("/System/Library/Fonts/Supplemental/Arial.ttf");
 #elif defined(__ANDROID__)
@@ -62,14 +83,18 @@ const Font& font(uint32_t type) {
     candidates.push_back("C:/Windows/Fonts/arial.ttf");
 #endif
     std::vector<uint8_t> ttf;
+    std::string tried;
     for (const auto& path : candidates) {
         ttf = read_file(path);
-        if (!ttf.empty()) {
-            log("pl: shared font %u <- %s (%zu bytes)", type, path.c_str(), ttf.size());
+        if (single_font(ttf)) {
+            log("pl: shared font %u (%s) <- %s (%zu bytes)", type, kTypeNames[type], path.c_str(), ttf.size());
             break;
         }
+        if (!ttf.empty()) log("pl: %s is not a single TrueType or OpenType font, skipped", path.c_str());
+        ttf.clear();
+        tried += (tried.empty() ? "" : ", ") + path;
     }
-    if (ttf.empty()) log("pl: no font for shared font %u (put one in %s)", type, root.c_str());
+    if (ttf.empty()) log("pl: shared font %u (%s) missing; tried %s", type, kTypeNames[type], tried.c_str());
     f.size = ttf.size() + 8;
     f.addr = kernel_alloc(f.size);
     st<uint32_t>(f.addr, 0x18029A7F);  // plain magic: "already decoded"

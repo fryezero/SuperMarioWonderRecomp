@@ -10,6 +10,7 @@ __pycache__/
 *.nsz
 *.xcz
 *.rar
+*.zip
 *.keys
 
 # Local tooling state and run logs.

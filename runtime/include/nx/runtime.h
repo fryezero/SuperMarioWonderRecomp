@@ -17,41 +17,26 @@ void log(const char* fmt, ...);
 extern bool g_trace;  // verbose tracing (NX_TRACE=1)
 
 // ---- address space --------------------------------------------------------------------------------------------
-// Guest pointers are host pointers. Everything the guest can see lives in these reserved ranges.
+// Guest pointers are host pointers. Everything the guest can see lives in reserved ranges. The modules sit at a fixed
+// address (NX_BASE, compiled into the generated code); memory_init places every other region and the guest learns
+// them from svcGetInfo, so the layout can follow what the host leaves free. macOS 27 and iOS 27 keep almost all of
+// 0x1_8000_0000..0x70_0000_0000 for the shared cache and the GPU, and macOS puts a 24 GiB heap range at a random
+// place in 0x70..0x80_0000_0000 at every launch; Windows and Android use fixed places (memory.cpp).
 
-constexpr uint64_t kAddressSpaceBase = 0x0008000000ull;
-constexpr uint64_t kAddressSpaceSize = 0x7FF8000000ull;  // 39-bit, like an application on Horizon
 constexpr uint64_t kModuleBase = NX_BASE;  // main; sdk at +0x10000000 (NX_BASE, nx/cpu.h)
-constexpr uint64_t kHeapMax = 0x180000000ull;  // 6 GiB
-constexpr uint64_t kStackSize = 0x100000000ull;
-constexpr uint64_t kKernelSize = 0x100000000ull;
-constexpr uint64_t kThunkSize = 0x100000ull;
-#if defined(__APPLE__)
-// macOS: only 0x3_0000_0000..0xF_FFFF_FFFF is free below 0x70_0000_0000 (see NX_BASE).
-constexpr uint64_t kHeapBase = 0x400000000ull;
-constexpr uint64_t kAliasBase = 0x600000000ull;
-constexpr uint64_t kAliasSize = 0x400000000ull;
-constexpr uint64_t kStackBase = 0xA00000000ull;
-constexpr uint64_t kKernelBase = 0xB00000000ull;
-constexpr uint64_t kThunkBase = 0xE00000000ull;
-#else
-constexpr uint64_t kHeapBase = 0x5000000000ull;
-#if defined(__ANDROID__)
-// Android maps the zygote's executable (app_process64, position independent) at a random address from about
-// 0x55_5555_0000 to 0x65_5555_0000 at every boot, inside 0x58..0x68: a Galaxy S23 refused the alias reservation
-// ("the range is in use", app_process64 at 0x5f_0972_b000). Below the modules nothing is mapped (ART keeps to the
-// low 4 GiB), so the alias region goes there. The guest learns it from svcGetInfo, like every region but the modules.
-constexpr uint64_t kAliasBase = 0x2000000000ull;
-#else
-constexpr uint64_t kAliasBase = 0x5800000000ull;
-#endif
-constexpr uint64_t kAliasSize = 0x1000000000ull;
-constexpr uint64_t kStackBase = 0x6800000000ull;
-// Kept below 0x70_0000_0000: Android (39-bit address space) maps the process's own libraries and heap up there.
-constexpr uint64_t kKernelBase = 0x6A00000000ull;
-constexpr uint64_t kThunkBase = 0x6F00000000ull;
-#endif
-// kKernelBase: TLS pages, main thread stack (memory we hand out). kThunkBase: HLE function addresses (never mapped).
+constexpr uint64_t kModuleSize = 0x20000000ull;
+
+struct GuestLayout {
+    uint64_t space_base = 0, space_size = 0;  // the ASLR region (svcGetInfo 12/13): every region below lies in it
+    uint64_t heap_base = 0, heap_max = 0;     // svcSetHeapSize grows from heap_base, up to heap_max
+    uint64_t alias_base = 0, alias_size = 0;  // nn::os VAMM, mapped memory
+    uint64_t stack_base = 0, stack_size = 0;  // thread stacks (MapMemory), shared and transfer memory
+    uint64_t kernel_base = 0, kernel_size = 0;  // memory we hand out: TLS pages, main thread stack, shared memory
+    uint64_t thunk_base = 0, thunk_size = 0;    // HLE function addresses (reserved, never mapped)
+};
+extern GuestLayout g_layout;  // set by memory_init, before anything else runs guest code
+// Inside some region of the guest (a cheap sanity check for pointers read from guest memory).
+inline bool is_guest(uint64_t p) { return p - g_layout.space_base < g_layout.space_size; }
 
 void memory_init();
 bool commit(uint64_t addr, uint64_t size);   // make [addr, addr+size) read/write

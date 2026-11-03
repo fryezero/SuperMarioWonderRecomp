@@ -140,7 +140,7 @@ static void dump_threads() {
         if (!t || !t->started || t->exited) continue;
         std::string chain = describe(t->ctx.x[30]);
         uint64_t fp = t->ctx.x[29];
-        for (int k = 0; k < 12 && fp && (fp & 7) == 0 && fp >= kModuleBase; k++) {
+        for (int k = 0; k < 12 && fp && (fp & 7) == 0 && is_guest(fp); k++) {
             uint64_t lr = ld<uint64_t>(fp + 8);
             if (!lr) break;
             chain += " < " + describe(lr);

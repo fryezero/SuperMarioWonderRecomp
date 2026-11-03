@@ -61,4 +61,14 @@ ServiceRegistrar r_aoc("aoc:u", [] {
 
 }  // namespace
 
+// New in Wonder 1.2.1. The Switch 2 Edition upgrade page of the eShop (1.2.1 main+1d1fb88) is a library applet we do
+// not have: report it as shown and closed. No add-on content is installed (main+18acb3c, right after
+// pl::IsRunningOnOunce, which the sdk itself answers false).
+static void shop_closed(CPU& c) { c.x[0] = 0; }
+static void no_add_on_content(CPU& c) { c.x[0] = 0; }
+NX_HLE("_ZN2nn2ec40ShowShopApplicationInformationForUpgradeENS0_14UpgradeEditionE", shop_closed);
+NX_HLE("_ZN2nn2ec40ShowShopApplicationInformationForUpgradeENS0_14UpgradeEditionERKNS_7account10UserHandleE",
+       shop_closed);
+NX_HLE("_ZN2nn3aoc17CountAddOnContentEv", no_add_on_content);
+
 }  // namespace nx

@@ -116,3 +116,36 @@ depth clamp. Absent: `geometryShader`, `VK_EXT_transform_feedback`, `logicOp`, `
 Consequences for the plan: memory pools can be imported directly (the PC path of N3 works on the Mac); ASTC needs
 no decoder; transform feedback, geometry shaders and logic ops, if the trace shows Wonder uses them, need
 workarounds (compute emulation / shader rewrites).
+
+## Version 1.2.1
+
+The update (patch v327680, display version 1.2.1, built with SDK 16.2.12; key generation 17) recompiles with no
+changes to the recompiler: `main` 212,403 functions (.text 0x2138650), `sdk` 40,411, 0 unhandled instructions. The
+shaders translate as before: 12,757 blocks (6 more than 1.0.0, from the new `static.Product.110` effect set), all
+valid SPIR-V.
+
+Extraction. The update's ExeFS comes out with nstool and the update's own ticket (`--tik`). Its RomFS is a BKTR patch
+over the base game's: hactool stops at "Invalid BKTR layout!" and nstool cannot open it, so `tools/romfs_patch`
+(LibHac from NuGet) merges and extracts it:
+
+```sh
+N=private/tools/nstool/nstool; K=private/keys/prod.keys; W=private/wonder
+$N -k $K -x $W/nsp_base base.nsp; $N -k $K -x $W/nsp_update update.nsp     # NCAs + tickets
+$N -k $K --tik $W/nsp_update/<rights id>.tik -x /0 $W/update/exefs $W/nsp_update/<program>.nca
+# title.keys for romfs_patch: "<rights id> = <encrypted title key>" (ticket +0x2A0 and +0x180), one per ticket
+dotnet private/build/romfs_patch/bin/Release/net10.0/romfs_patch.dll $K <title.keys> \
+    $W/nsp_base/<program>.nca $W/nsp_update/<program>.nca $W/romfs           # 19,034 files, 3.73 GB
+```
+
+What the runtime had pinned to 1.0.0, and how it finds it now (the same code runs both versions):
+
+| What | 1.0.0 | 1.2.1 | Found by |
+|---|---|---|---|
+| procFrame_ present-interval call (60 fps governor) | main+e16ac | main+cfde4 | its code, masked (`nvn_queue.cpp`) |
+| AudioRenderer sf object vtable | sdk+d04910 | sdk+d05910 | sdk export (`hle_audio.cpp`) |
+| ExecuteAudioRendererRendering | sdk+20cac8 | sdk+20cc48 | sdk export |
+| NVN format table | sdk+d34198 | sdk+d351a8 | its contents: seven formats of known shape (`nvn_texture_layout.cpp`) |
+
+New imports in 1.2.1: `nn::nfp` (amiibo; the sdk aborts at boot without `nfp:user`, so `hle_nfp.cpp` answers as a
+console with no NFC reader), `nn::ec::ShowShopApplicationInformationForUpgrade` (the Switch 2 Edition upgrade page:
+reported shown and closed), `nn::aoc::CountAddOnContent` (0) and `nn::account::PopOpenUsers` (none).

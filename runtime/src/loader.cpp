@@ -10,6 +10,7 @@
 
 #include <nx/runtime.h>
 
+#include "phone.h"
 #include "platform.h"
 
 namespace nx {
@@ -52,8 +53,8 @@ void log(const char* fmt, ...) {
     std::lock_guard lk(g_log_lock);
     if (!g_log_file) {
         const char* path = std::getenv("NX_LOG");
-#if defined(__ANDROID__)
-        std::string def = plat::data_root() + "/nx.log";  // next to the data, readable from the phone
+#if NX_PHONE
+        std::string def = plat::data_root() + "/nx.log";  // next to the data, readable from the phone (iOS: Documents)
 #else
         std::string def = plat::data_root() + "/../nx.log";
 #endif
@@ -99,12 +100,12 @@ uint64_t hle_address_or(const char* name, HleFn fallback) {
     static std::mutex lock;  // NVN hands out procs by name at run time, from any thread
     std::lock_guard lk(lock);
     // Other threads index g_thunks while we add to it: never reallocate (one entry per 16 bytes of the region).
-    if (g_thunks.capacity() < kThunkSize / 16) g_thunks.reserve(kThunkSize / 16);
+    if (g_thunks.capacity() < g_layout.thunk_size / 16) g_thunks.reserve(g_layout.thunk_size / 16);
     auto it = g_thunk_by_name.find(name);
     if (it != g_thunk_by_name.end()) return it->second;
-    if (g_thunks.size() == kThunkSize / 16) fatal("out of HLE thunks");
+    if (g_thunks.size() == g_layout.thunk_size / 16) fatal("out of HLE thunks");
     HleFn fn = hle_lookup(name);
-    uint64_t addr = kThunkBase + g_thunks.size() * 16;
+    uint64_t addr = g_layout.thunk_base + g_thunks.size() * 16;
     g_thunks.push_back({name, fn ? fn : fallback});
     g_thunk_by_name[name] = addr;
     return addr;
@@ -124,8 +125,8 @@ const LoadedModule* module_at(uint64_t addr) {
 
 std::string describe(uint64_t addr) {
     char buf[512];
-    if (addr - kThunkBase < kThunkSize) {
-        size_t i = (addr - kThunkBase) / 16;
+    if (addr - g_layout.thunk_base < g_layout.thunk_size) {
+        size_t i = (addr - g_layout.thunk_base) / 16;
         snprintf(buf, sizeof buf, "hle:%s", i < g_thunks.size() ? g_thunks[i].name.c_str() : "?");
         return buf;
     }
@@ -178,8 +179,8 @@ void call(CPU& c, uint64_t t) {
             return;
         }
     }
-    uint64_t off = t - kThunkBase;
-    if (off < kThunkSize && off / 16 < g_thunks.size()) {
+    uint64_t off = t - g_layout.thunk_base;
+    if (off < g_layout.thunk_size && off / 16 < g_thunks.size()) {
         const Thunk& th = g_thunks[off / 16];
         if (g_trace) log("hle %s", th.name.c_str());
         const char* prev = t_missing_name;

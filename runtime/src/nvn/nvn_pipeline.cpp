@@ -1,5 +1,7 @@
 // Pipelines and sampled resources (nvn_pipeline.h). Everything is cached for the life of the process: layouts by
-// their bindings, pipelines by their full state, samplers by their state, views by (image, type).
+// their bindings, pipelines by their full state, samplers by their state, views by (image, type). A pipeline the cache
+// does not have comes from nvn_pipeline_warm.cpp: the start's warm-up built it, another key had the same create info,
+// or it is created and recorded, with its modules and layout, for the next start's warm-up.
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +12,7 @@
 #include <unordered_map>
 
 #include "nvn_pipeline.h"
+#include "nvn_pipeline_warm.h"
 #include "platform.h"
 
 namespace nx::nvn {
@@ -80,7 +83,10 @@ VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr, ui
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = code.size() * 4;
         ci.pCode = code.data();
-        if (p_vkCreateShaderModule(vk_device(), &ci, nullptr, &m) != VK_SUCCESS) log("nvn/vk: shader %s rejected", s->hash.c_str());
+        if (p_vkCreateShaderModule(vk_device(), &ci, nullptr, &m) == VK_SUCCESS)
+            capture_module(m, code);  // the words this variant was made from, its patches included
+        else
+            log("nvn/vk: shader %s rejected", s->hash.c_str());
         static int logged = 0;
         if (is_patched && logged++ < 20) log("nvn/vk: shader %s: integer vertex inputs", s->hash.c_str());
     }
@@ -95,7 +101,7 @@ VkDescriptorSetLayout set_layout(const std::vector<VkDescriptorSetLayoutBinding>
         VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         ci.bindingCount = uint32_t(bindings.size());
         ci.pBindings = bindings.data();
-        p_vkCreateDescriptorSetLayout(vk_device(), &ci, nullptr, &l);
+        if (p_vkCreateDescriptorSetLayout(vk_device(), &ci, nullptr, &l) == VK_SUCCESS) capture_set_layout(l, ci);
     }
     return l;
 }
@@ -244,7 +250,8 @@ const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages
     VkPipelineLayoutCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     ci.setLayoutCount = 4;
     ci.pSetLayouts = pl.sets;
-    p_vkCreatePipelineLayout(vk_device(), &ci, nullptr, &pl.layout);
+    if (p_vkCreatePipelineLayout(vk_device(), &ci, nullptr, &pl.layout) == VK_SUCCESS)
+        capture_pipeline_layout(pl.layout, ci);
     return cache[stages] = pl;
 }
 
@@ -431,11 +438,10 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     ci.pColorBlendState = &cb;
     ci.pDynamicState = &dy;
     ci.layout = layout.layout;
-    VkPipeline p = VK_NULL_HANDLE;
     const uint64_t t0 = plat::monotonic_ns();
-    VkResult made = p_vkCreateGraphicsPipelines(vk_device(), pipeline_cache(), 1, &ci, nullptr, &p);
+    VkPipeline p = replay_pipeline(ci);
     note_pipeline_created(plat::monotonic_ns() - t0);
-    if (made != VK_SUCCESS)
+    if (!p)
         log("nvn/vk: pipeline for %s + %s failed", key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
     else if (g_trace)
         log("nvn/vk: pipeline %zu: %s + %s", cache.size() + 1, key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
@@ -609,10 +615,10 @@ VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgramLayout& layout) {
         ci.stage.module = module_of(cs);
         ci.stage.pName = "main";
         ci.layout = layout.layout;
-        if (p_vkCreateComputePipelines(vk_device(), pipeline_cache(), 1, &ci, nullptr, &p) != VK_SUCCESS) {
-            log("nvn/vk: compute pipeline for %s failed", cs->hash.c_str());
-            p = VK_NULL_HANDLE;
-        }
+        const uint64_t t0 = plat::monotonic_ns();
+        p = replay_pipeline(ci);
+        note_pipeline_created(plat::monotonic_ns() - t0);
+        if (!p) log("nvn/vk: compute pipeline for %s failed", cs->hash.c_str());
     }
     return p;
 }

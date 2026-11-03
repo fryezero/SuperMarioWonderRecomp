@@ -10,6 +10,7 @@ namespace nx::plat {
 
 // ---- memory: fixed-address reservations (guest pointers are host pointers) ----
 bool reserve(uint64_t addr, uint64_t size);  // exactly at addr, no access
+void release(uint64_t addr, uint64_t size);  // undo a reserve (Apple: probing for free space, memory.cpp)
 bool commit(uint64_t addr, uint64_t size);   // read/write
 void decommit(uint64_t addr, uint64_t size);
 
@@ -51,6 +52,10 @@ void window_size(uint32_t& w, uint32_t& h);  // client size in pixels
 void screen_size(uint32_t& w, uint32_t& h);  // the display's own size, landscape (Android; the window on PC)
 // The render scale to use when the player sets none: 1 on fast GPUs, less on slower ones (Android).
 float default_render_scale();
+// Display-synchronised vsync (iOS: CADisplayLink at 60 Hz). False where the platform has none (hle_vi.cpp then keeps
+// its own 60 Hz timer; the default in perf_hint.cpp); otherwise tick(vsync_ns) is called from a platform thread at each
+// display refresh, vsync_ns on the monotonic_ns() clock.
+bool vsync_source(void (*tick)(uint64_t vsync_ns));
 
 // NpadButton bits (Nintendo layout: A is the right face button, B the bottom one).
 enum : uint64_t {

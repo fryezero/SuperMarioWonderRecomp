@@ -1,14 +1,18 @@
 // Drawn touch controls (docs/nvn/ANDROID-PORT.md A4): a fixed layout of round buttons per game, hit-tested by
-// platform_android_input.cpp and drawn by the NVN present pass (nvn_present.cpp) over the picture.
+// touch_controls.cpp (Android, iOS) and drawn by the NVN present pass (nvn_present.cpp) over the picture.
 //
 // Super Mario Bros. Wonder, landscape: A (jump, the big one) at the bottom right with B (jump), Y (dash, action) and
-// X (action) around it; ZR (roll), R, L, + and - along the top. The left half is the stick (platform_android_input.cpp):
-// it appears where the thumb lands, and pushed nearly all the way it also holds Y, so running needs no second thumb.
+// X (action) around it; ZR (roll), R, L, + and - along the top. The left half is the stick (touch_controls.cpp): it
+// appears where the thumb lands, and pushed nearly all the way it also holds Y, so running needs no second thumb.
 // Games without a layout here keep their own touch handling (Hades: zones around the thumb).
 //
-// Elsewhere touch_overlay() draws nothing, except with NX_OVERLAY_DEMO=1 (the buttons at rest), to check the look
-// on the Mac with NX_PRESENT_TEST.
+// Elsewhere (no touch_controls.cpp) touch_overlay() draws nothing, except with NX_OVERLAY_DEMO=1 (the buttons at
+// rest), to check the look on the Mac with NX_PRESENT_TEST.
 #include "touch_layout.h"
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 #include <cmath>
 #include <cstdlib>
@@ -47,7 +51,7 @@ uint64_t touch_hit(float x, float y, float aspect) {
     return best;
 }
 
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !(defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE)
 size_t touch_overlay(OverlayShape* out, size_t max) {
     static const bool demo = std::getenv("NX_OVERLAY_DEMO") != nullptr;
     if (!demo) return 0;
